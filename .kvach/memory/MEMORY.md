@@ -26,5 +26,9 @@
 - [project_validation.md](project_validation.md) — FieldValidator with FieldRule: Required, Enum, MinInt/MaxInt, MaxLen. Supports one level of nested fields (dot notation). Catches "LLM Theater" before tool execution.
 - [project_pipeline.md](project_pipeline.md) — Generic Pipeline[I,O] with Handler[I,O] func type. First handler returning (result, true) wins. Prepend/Append for priority control. Used for input preprocessing, output filtering, event routing.
 
+## Workflow
+- [project_pr_workflow.md](project_pr_workflow.md) — PR workflow: 1) create branch, 2) stage+commit, 3) push, 4) create PR, 5) review, 6) wait for Copilot review, 7) fix Copilot comments if any, 8) merge. Never merge without waiting for Copilot.
+- [project_copilot_instructions.md](project_copilot_instructions.md) — GitHub Copilot instructions in .github/: copilot-instructions.md (repo-wide) + 5 path-specific instruction files in .github/instructions/ (go-code, agent-definitions, skill-definitions, docs, memory).
+
 ## Dependencies
 - [project_dependencies.md](project_dependencies.md) — gopkg.in/yaml.v3 (YAML parsing), github.com/spf13/cobra (CLI). Stdlib for everything else. No test frameworks — stdlib testing only.
