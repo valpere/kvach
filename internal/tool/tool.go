@@ -86,6 +86,12 @@ type Context struct {
 	// TaskRunner executes delegated subagent tasks for the Task tool.
 	TaskRunner any // will be multiagent.Runner once import cycles are settled
 
+	// SessionStore allows tools to persist session-scoped state.
+	SessionStore any // will be session.Store once import cycles are settled
+
+	// EventBus allows tools to publish UI-facing events.
+	EventBus any // will be *bus.Bus once import cycles are settled
+
 	// Abort is cancelled when the user interrupts the current run.
 	Abort context.Context
 }

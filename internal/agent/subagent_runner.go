@@ -209,6 +209,7 @@ func (r *subagentRunner) newChildAgent(opts multiagent.Options) (*Agent, error) 
 		registry: r.parent.registry,
 		sessions: r.parent.sessions,
 		tasks:    r,
+		bus:      r.parent.bus,
 		config:   cfg,
 	}
 	return child, nil
