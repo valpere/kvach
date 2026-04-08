@@ -171,10 +171,8 @@ func (t *taskTool) Call(ctx context.Context, raw json.RawMessage, tctx *tool.Con
 		}
 	}
 
-	// TODO(phase2): wire up multiagent.Runner and return the real subagent
-	// result envelope.
 	content := fmt.Sprintf(
-		"TODO: Task tool not yet implemented. mode=%s profile=%q description=%q command=%q\nExpected subagent output contract:\n- summary\n- findings[]\n- changed_files[]\n- next_actions[]",
+		"Task runner unavailable. mode=%s profile=%q description=%q command=%q\nExpected subagent output contract:\n- summary\n- findings[]\n- changed_files[]\n- next_actions[]",
 		resume,
 		profile,
 		in.Description,

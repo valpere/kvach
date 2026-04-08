@@ -63,13 +63,14 @@ func New(p provider.Provider, r *tool.Registry, s session.Store, cfg Config) *Ag
 	if cfg.AgentName == "" {
 		cfg.AgentName = "build"
 	}
-	return &Agent{
+	a := &Agent{
 		provider: p,
 		registry: r,
 		sessions: s,
-		tasks:    newSubagentRunner(),
 		config:   cfg,
 	}
+	a.tasks = newSubagentRunner(a)
+	return a
 }
 
 // RunOptions parameterises a single Run call.
