@@ -1,9 +1,13 @@
 package task
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/valpere/kvach/internal/multiagent"
+	"github.com/valpere/kvach/internal/tool"
 )
 
 func TestInputProfile(t *testing.T) {
@@ -99,5 +103,39 @@ func TestCallIncludesModeAndProfile(t *testing.T) {
 	}
 	if !strings.Contains(res.Content, "profile=\"explore\"") {
 		t.Fatalf("expected profile in output, got %q", res.Content)
+	}
+}
+
+type stubRunner struct{}
+
+func (stubRunner) Run(_ context.Context, opts multiagent.Options) (multiagent.Result, error) {
+	return multiagent.Result{
+		TaskID:  "task-1",
+		State:   multiagent.TaskCompleted,
+		Profile: opts.Profile,
+		Output:  "runner output",
+	}, nil
+}
+
+func (stubRunner) Status(_ context.Context, _ string) (multiagent.TaskState, error) {
+	return multiagent.TaskCompleted, nil
+}
+
+func (stubRunner) Cancel(_ context.Context, _ string) error { return nil }
+
+func TestCallUsesRunnerWhenAvailable(t *testing.T) {
+	tt := &taskTool{}
+	raw, _ := json.Marshal(map[string]any{
+		"description":   "run task",
+		"prompt":        "do work",
+		"subagent_type": "explore",
+	})
+
+	res, err := tt.Call(t.Context(), raw, &tool.Context{TaskRunner: stubRunner{}})
+	if err != nil {
+		t.Fatalf("call with runner: %v", err)
+	}
+	if res == nil || res.Content != "runner output" {
+		t.Fatalf("expected runner output, got %#v", res)
 	}
 }

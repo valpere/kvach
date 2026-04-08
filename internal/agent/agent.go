@@ -12,8 +12,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 
+	"github.com/google/uuid"
+	"github.com/valpere/kvach/internal/git"
+	"github.com/valpere/kvach/internal/memory"
+	"github.com/valpere/kvach/internal/multiagent"
 	"github.com/valpere/kvach/internal/provider"
 	"github.com/valpere/kvach/internal/session"
 	"github.com/valpere/kvach/internal/tool"
@@ -24,6 +29,7 @@ type Agent struct {
 	provider provider.Provider
 	registry *tool.Registry
 	sessions session.Store
+	tasks    multiagent.Runner
 	config   Config
 }
 
@@ -61,6 +67,7 @@ func New(p provider.Provider, r *tool.Registry, s session.Store, cfg Config) *Ag
 		provider: p,
 		registry: r,
 		sessions: s,
+		tasks:    newSubagentRunner(),
 		config:   cfg,
 	}
 }
@@ -91,6 +98,11 @@ func (a *Agent) Run(ctx context.Context, opts RunOptions) (<-chan Event, error) 
 
 // loop is the core agentic while-loop.
 func (a *Agent) loop(ctx context.Context, opts RunOptions, events chan<- Event) error {
+	sessionID, err := a.ensureSession(ctx, opts.SessionID)
+	if err != nil {
+		return err
+	}
+
 	// Build initial messages from the user prompt.
 	messages := []provider.Message{
 		{
@@ -100,9 +112,21 @@ func (a *Agent) loop(ctx context.Context, opts RunOptions, events chan<- Event) 
 			},
 		},
 	}
+	_ = a.persistProviderMessage(ctx, sessionID, messages[0], "", 0, 0, 0)
 
 	// Build the tool schemas for the LLM.
 	tools := a.buildToolSchemas()
+
+	// Load project memory index and append it to the system prompt when present.
+	systemPrompt := a.config.SystemPrompt
+	if strings.TrimSpace(a.config.WorkDir) != "" {
+		mem := memory.NewSystem(filepath.Join(a.config.WorkDir, ".kvach", "memory"))
+		if mem.IsEnabled() {
+			if idx, err := mem.LoadIndexPrompt(""); err == nil && strings.TrimSpace(idx) != "" {
+				systemPrompt = strings.TrimSpace(systemPrompt) + "\n\n# Memory Index\n\n" + idx
+			}
+		}
+	}
 
 	for turn := 0; turn < a.config.MaxTurns; turn++ {
 		if ctx.Err() != nil {
@@ -115,7 +139,7 @@ func (a *Agent) loop(ctx context.Context, opts RunOptions, events chan<- Event) 
 			Model:     a.config.Model,
 			Messages:  messages,
 			Tools:     tools,
-			System:    a.config.SystemPrompt,
+			System:    systemPrompt,
 			MaxTokens: 8192,
 		}
 
@@ -132,6 +156,7 @@ func (a *Agent) loop(ctx context.Context, opts RunOptions, events chan<- Event) 
 
 		// Append assistant message to history.
 		messages = append(messages, assistantMsg)
+		_ = a.persistProviderMessage(ctx, sessionID, assistantMsg, finishReason, 0, 0, 0)
 
 		// If no tool calls, we're done.
 		if len(toolCalls) == 0 {
@@ -154,10 +179,123 @@ func (a *Agent) loop(ctx context.Context, opts RunOptions, events chan<- Event) 
 			Parts: resultParts,
 		}
 		messages = append(messages, resultMsg)
+		_ = a.persistProviderMessage(ctx, sessionID, resultMsg, "", 0, 0, 0)
 	}
 
 	events <- Event{Type: EventDone, Payload: string(ReasonMaxTurns)}
 	return nil
+}
+
+func (a *Agent) ensureSession(ctx context.Context, sessionID string) (string, error) {
+	if a.sessions == nil {
+		return "", nil
+	}
+	if strings.TrimSpace(sessionID) != "" {
+		if _, err := a.sessions.GetSession(ctx, sessionID); err != nil {
+			return "", fmt.Errorf("load session %s: %w", sessionID, err)
+		}
+		return sessionID, nil
+	}
+
+	id := uuid.NewString()
+	projectID := "project"
+	if strings.TrimSpace(a.config.WorkDir) != "" {
+		if root, err := git.Root(ctx, a.config.WorkDir); err == nil {
+			projectID = git.SlugFromRoot(root)
+		} else {
+			projectID = git.SlugFromRoot(a.config.WorkDir)
+		}
+	}
+
+	err := a.sessions.CreateSession(ctx, session.Session{
+		ID:        id,
+		ProjectID: projectID,
+		Directory: a.config.WorkDir,
+		Title:     "kvach run",
+	})
+	if err != nil {
+		return "", fmt.Errorf("create session: %w", err)
+	}
+	return id, nil
+}
+
+func (a *Agent) persistProviderMessage(ctx context.Context, sessionID string, msg provider.Message, finishReason string, inputTokens, outputTokens int, cost float64) error {
+	if a.sessions == nil || sessionID == "" {
+		return nil
+	}
+
+	messageID := uuid.NewString()
+	err := a.sessions.AppendMessage(ctx, session.Message{
+		ID:           messageID,
+		SessionID:    sessionID,
+		Role:         msg.Role,
+		AgentName:    a.config.AgentName,
+		ModelID:      a.config.Model,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		CostUSD:      cost,
+		FinishReason: finishReason,
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, part := range msg.Parts {
+		payload, ptype := mapProviderPart(part)
+		if payload == nil {
+			continue
+		}
+		data, err := json.Marshal(payload)
+		if err != nil {
+			continue
+		}
+		_ = a.sessions.AppendPart(ctx, session.Part{
+			ID:        uuid.NewString(),
+			MessageID: messageID,
+			Type:      ptype,
+			Data:      data,
+		})
+	}
+	return nil
+}
+
+func mapProviderPart(part provider.Part) (any, session.PartType) {
+	switch part.Type {
+	case provider.PartTypeText:
+		return session.TextData{Text: part.Text}, session.PartTypeText
+	case provider.PartTypeReasoning:
+		return session.ReasoningData{Reasoning: part.Text}, session.PartTypeReasoning
+	case provider.PartTypeToolUse:
+		if part.ToolUse == nil {
+			return nil, ""
+		}
+		return session.ToolUseData{
+			ID:    part.ToolUse.ID,
+			Name:  part.ToolUse.Name,
+			Input: part.ToolUse.Input,
+			State: "completed",
+		}, session.PartTypeToolUse
+	case provider.PartTypeToolResult:
+		if part.ToolResult == nil {
+			return nil, ""
+		}
+		return session.ToolResultData{
+			ToolUseID: part.ToolResult.ToolUseID,
+			Content:   part.ToolResult.Content,
+			IsError:   part.ToolResult.IsError,
+		}, session.PartTypeToolResult
+	case provider.PartTypeFile:
+		if part.File == nil {
+			return nil, ""
+		}
+		return session.FileData{
+			Path:     part.File.Path,
+			MimeType: part.File.MimeType,
+			URL:      part.File.URL,
+		}, session.PartTypeFile
+	default:
+		return nil, ""
+	}
 }
 
 // processStream reads all events from the stream channel and assembles
@@ -237,7 +375,8 @@ func (a *Agent) processStream(stream <-chan provider.StreamEvent, events chan<- 
 // executeToolCalls runs each tool call and returns the result parts.
 func (a *Agent) executeToolCalls(ctx context.Context, calls []toolCall, events chan<- Event) []provider.Part {
 	tctx := &tool.Context{
-		WorkDir: a.config.WorkDir,
+		WorkDir:    a.config.WorkDir,
+		TaskRunner: a.tasks,
 	}
 
 	var parts []provider.Part

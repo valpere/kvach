@@ -3,11 +3,14 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/valpere/kvach/internal/agent"
 	"github.com/valpere/kvach/internal/config"
+	"github.com/valpere/kvach/internal/provider"
 	anthropicProvider "github.com/valpere/kvach/internal/provider/anthropic"
+	openaiProvider "github.com/valpere/kvach/internal/provider/openai"
 	"github.com/valpere/kvach/internal/tool"
 )
 
@@ -45,8 +48,20 @@ The agent runs the full agentic loop (including tool calls) and exits when compl
 				model = globalFlags.Model
 			}
 
-			// Create provider. For now, only Anthropic is fully implemented.
-			prov := anthropicProvider.New("", "")
+			providerName, modelID := splitModel(model)
+			var prov provider.Provider
+			switch providerName {
+			case "openai", "groq", "openrouter", "together":
+				prov = openaiProvider.NewCompatible(providerName, strings.Title(providerName), "", "")
+			default:
+				prov = anthropicProvider.New("", "")
+			}
+
+			store, err := openSessionStore(ctx)
+			if err != nil {
+				return fmt.Errorf("open session store: %w", err)
+			}
+			defer store.Close()
 
 			// Build system prompt from discovered instructions.
 			systemPrompt := cfg.Instructions
@@ -55,11 +70,11 @@ The agent runs the full agentic loop (including tool calls) and exits when compl
 			}
 
 			// Create the agent.
-			a := agent.New(prov, tool.DefaultRegistry, nil, agent.Config{
+			a := agent.New(prov, tool.DefaultRegistry, store, agent.Config{
 				MaxTurns:     cfg.MaxTurns,
 				WorkDir:      workDir,
 				SystemPrompt: systemPrompt,
-				Model:        model,
+				Model:        modelID,
 			})
 
 			// Run and stream events to stdout.
@@ -110,4 +125,18 @@ The agent runs the full agentic loop (including tool calls) and exits when compl
 	cmd.Flags().StringVar(&runFlags.SessionID, "resume", "", "Resume an existing session by ID")
 	cmd.Flags().BoolVar(&runFlags.Continue, "continue", false, "Continue the most recent session")
 	return cmd
+}
+
+func splitModel(model string) (providerName, modelID string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "anthropic", "claude-sonnet-4-5"
+	}
+	if i := strings.IndexByte(model, '/'); i > 0 {
+		return strings.ToLower(model[:i]), model[i+1:]
+	}
+	if strings.HasPrefix(model, "gpt-") || strings.HasPrefix(model, "o") {
+		return "openai", model
+	}
+	return "anthropic", model
 }

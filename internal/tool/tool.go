@@ -80,6 +80,12 @@ type Context struct {
 	// Asker is used by tools that need to pause and ask the user a question.
 	Asker any // will be permission.Asker once that package is ready
 
+	// SkillLoader is used by activate_skill to resolve skills from disk.
+	SkillLoader any // will be skill.Loader once import cycles are settled
+
+	// TaskRunner executes delegated subagent tasks for the Task tool.
+	TaskRunner any // will be multiagent.Runner once import cycles are settled
+
 	// Abort is cancelled when the user interrupts the current run.
 	Abort context.Context
 }
