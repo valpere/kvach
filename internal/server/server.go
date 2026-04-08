@@ -13,17 +13,27 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/valpere/kvach/internal/agent"
 	"github.com/valpere/kvach/internal/config"
 	"github.com/valpere/kvach/internal/git"
+	"github.com/valpere/kvach/internal/provider"
+	anthropicProvider "github.com/valpere/kvach/internal/provider/anthropic"
+	googleProvider "github.com/valpere/kvach/internal/provider/google"
+	openaiProvider "github.com/valpere/kvach/internal/provider/openai"
 	"github.com/valpere/kvach/internal/session"
+	"github.com/valpere/kvach/internal/tool"
 )
 
 // Server is the HTTP API server.
@@ -32,17 +42,55 @@ type Server struct {
 	workDir  string
 	sessions session.Store
 	router   http.Handler
+
+	newAgent AgentFactory
+
+	mu     sync.RWMutex
+	nextID uint64
+	subs   map[string]map[uint64]chan streamedEvent
 }
 
 // Options configures server dependencies.
 type Options struct {
 	WorkDir      string
 	SessionStore session.Store
+	AgentFactory AgentFactory
+}
+
+// AgentRunner is the subset of agent.Agent used by the server.
+type AgentRunner interface {
+	Run(ctx context.Context, opts agent.RunOptions) (<-chan agent.Event, error)
+}
+
+// AgentFactoryArgs are inputs for creating an AgentRunner.
+type AgentFactoryArgs struct {
+	WorkDir string
+	Model   string
+	Config  *config.Config
+}
+
+// AgentFactory creates an agent runner for request-scoped execution.
+type AgentFactory func(ctx context.Context, args AgentFactoryArgs) (AgentRunner, error)
+
+type streamedEvent struct {
+	Name string
+	Data any
 }
 
 // New creates a Server with the given configuration.
 func New(cfg config.ServerConfig, opts Options) *Server {
-	s := &Server{cfg: cfg, workDir: opts.WorkDir, sessions: opts.SessionStore}
+	factory := opts.AgentFactory
+	if factory == nil {
+		factory = defaultAgentFactory(opts.SessionStore)
+	}
+
+	s := &Server{
+		cfg:      cfg,
+		workDir:  opts.WorkDir,
+		sessions: opts.SessionStore,
+		newAgent: factory,
+		subs:     make(map[string]map[uint64]chan streamedEvent),
+	}
 	s.router = s.buildRouter()
 	return s
 }
@@ -80,8 +128,11 @@ func (s *Server) buildRouter() http.Handler {
 	mux.HandleFunc("GET /project", s.handleProject)
 	mux.HandleFunc("GET /config", s.handleConfig)
 	mux.HandleFunc("GET /session", s.handleSessionList)
+	mux.HandleFunc("POST /session", s.handleSessionCreate)
 	mux.HandleFunc("GET /session/{id}", s.handleSessionGet)
 	mux.HandleFunc("DELETE /session/{id}", s.handleSessionArchive)
+	mux.HandleFunc("GET /session/{id}/messages", s.handleSessionMessages)
+	mux.HandleFunc("POST /session/{id}/prompt", s.handleSessionPrompt)
 	mux.HandleFunc("GET /session/{id}/events", s.handleSessionEvents)
 	return mux
 }
@@ -160,6 +211,55 @@ func (s *Server) handleSessionList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+type createSessionRequest struct {
+	Title     string `json:"title"`
+	ParentID  string `json:"parent_id,omitempty"`
+	Directory string `json:"directory,omitempty"`
+}
+
+func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
+	if s.sessions == nil {
+		http.Error(w, "session store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req createSessionRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	workDir := s.requestWorkDir(r)
+	if strings.TrimSpace(req.Directory) != "" {
+		workDir = strings.TrimSpace(req.Directory)
+	}
+	if root, err := git.Root(r.Context(), workDir); err == nil {
+		workDir = root
+	}
+
+	now := time.Now().UTC()
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		title = "New session"
+	}
+	sess := session.Session{
+		ID:        uuid.NewString(),
+		ProjectID: git.SlugFromRoot(workDir),
+		Directory: workDir,
+		Title:     title,
+		ParentID:  strings.TrimSpace(req.ParentID),
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := s.sessions.CreateSession(r.Context(), sess); err != nil {
+		http.Error(w, fmt.Sprintf("create session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, sess)
+}
+
 func (s *Server) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	if s.sessions == nil {
 		http.Error(w, "session store unavailable", http.StatusServiceUnavailable)
@@ -207,11 +307,216 @@ func (s *Server) handleSessionArchive(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "archived": true})
 }
 
+type messageEnvelope struct {
+	Message session.Message `json:"message"`
+	Parts   []partEnvelope  `json:"parts"`
+}
+
+type partEnvelope struct {
+	ID        string    `json:"id"`
+	Type      string    `json:"type"`
+	Data      any       `json:"data"`
+	CreatedAt time.Time `json:"createdAt"`
+	Raw       string    `json:"raw,omitempty"`
+}
+
+func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request) {
+	if s.sessions == nil {
+		http.Error(w, "session store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		http.Error(w, "session id is required", http.StatusBadRequest)
+		return
+	}
+
+	if _, err := s.sessions.GetSession(r.Context(), id); err != nil {
+		if err == session.ErrNotFound {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, fmt.Sprintf("get session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	msgs, err := s.sessions.GetMessages(r.Context(), id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("get messages: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	out := make([]messageEnvelope, 0, len(msgs))
+	for _, msg := range msgs {
+		parts, err := s.sessions.GetParts(r.Context(), msg.ID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("get parts: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		envParts := make([]partEnvelope, 0, len(parts))
+		for _, p := range parts {
+			decoded, raw := decodePartData(p)
+			envParts = append(envParts, partEnvelope{
+				ID:        p.ID,
+				Type:      string(p.Type),
+				Data:      decoded,
+				CreatedAt: p.CreatedAt,
+				Raw:       raw,
+			})
+		}
+
+		out = append(out, messageEnvelope{Message: msg, Parts: envParts})
+	}
+
+	writeJSON(w, http.StatusOK, out)
+}
+
+type promptRequest struct {
+	Prompt   string `json:"prompt"`
+	Model    string `json:"model,omitempty"`
+	MaxTurns int    `json:"max_turns,omitempty"`
+}
+
+type promptResponse struct {
+	SessionID    string          `json:"session_id"`
+	Output       string          `json:"output"`
+	FinishReason string          `json:"finish_reason"`
+	Usage        agent.UsageInfo `json:"usage"`
+}
+
+func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
+	if s.sessions == nil {
+		http.Error(w, "session store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		http.Error(w, "session id is required", http.StatusBadRequest)
+		return
+	}
+
+	sess, err := s.sessions.GetSession(r.Context(), id)
+	if err != nil {
+		if err == session.ErrNotFound {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, fmt.Sprintf("get session: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if sess.ArchivedAt != nil {
+		http.Error(w, "session is archived", http.StatusConflict)
+		return
+	}
+
+	var req promptRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+	req.Prompt = strings.TrimSpace(req.Prompt)
+	if req.Prompt == "" {
+		http.Error(w, "prompt is required", http.StatusBadRequest)
+		return
+	}
+
+	workDir := sess.Directory
+	if strings.TrimSpace(workDir) == "" {
+		workDir = s.requestWorkDir(r)
+	}
+
+	cfg, err := config.Load(workDir)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("load config: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if strings.TrimSpace(req.Model) != "" {
+		cfg.Model = strings.TrimSpace(req.Model)
+	}
+	if req.MaxTurns > 0 {
+		cfg.MaxTurns = req.MaxTurns
+	}
+
+	runner, err := s.newAgent(r.Context(), AgentFactoryArgs{WorkDir: workDir, Model: cfg.Model, Config: cfg})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("create agent: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	events, err := runner.Run(r.Context(), agent.RunOptions{Prompt: req.Prompt, SessionID: id})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("run agent: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	var (
+		output       strings.Builder
+		finishReason = ""
+		usage        agent.UsageInfo
+		agentErr     string
+	)
+
+	for evt := range events {
+		if evt.SessionID == "" {
+			evt.SessionID = id
+		}
+		s.publishEvent(id, string(evt.Type), map[string]any{
+			"type":       string(evt.Type),
+			"session_id": evt.SessionID,
+			"message_id": evt.MessageID,
+			"part_id":    evt.PartID,
+			"payload":    evt.Payload,
+		})
+
+		switch evt.Type {
+		case agent.EventTextDelta:
+			if s, ok := evt.Payload.(string); ok {
+				output.WriteString(s)
+			}
+		case agent.EventUsageUpdated:
+			if u, ok := evt.Payload.(agent.UsageInfo); ok {
+				usage = u
+			}
+		case agent.EventDone:
+			if reason, ok := evt.Payload.(string); ok {
+				finishReason = reason
+			}
+		case agent.EventError:
+			if e, ok := evt.Payload.(string); ok {
+				agentErr = e
+			}
+		}
+	}
+
+	if agentErr != "" {
+		http.Error(w, agentErr, http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, promptResponse{
+		SessionID:    id,
+		Output:       output.String(),
+		FinishReason: finishReason,
+		Usage:        usage,
+	})
+}
+
 func (s *Server) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("id"))
 	if id == "" {
 		http.Error(w, "session id is required", http.StatusBadRequest)
 		return
+	}
+	if s.sessions != nil {
+		if _, err := s.sessions.GetSession(r.Context(), id); err != nil {
+			if err == session.ErrNotFound {
+				http.Error(w, "session not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, fmt.Sprintf("get session: %v", err), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -228,6 +533,9 @@ func (s *Server) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "data: {\"sessionID\":%q}\n\n", id)
 	flusher.Flush()
 
+	ch, cancel := s.subscribeSession(id)
+	defer cancel()
+
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
@@ -235,9 +543,13 @@ func (s *Server) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case evt := <-ch:
+			if err := writeSSE(w, evt.Name, evt.Data); err != nil {
+				return
+			}
+			flusher.Flush()
 		case <-ticker.C:
-			_, _ = fmt.Fprintf(w, "event: ping\n")
-			_, _ = fmt.Fprintf(w, "data: {\"ts\":%d}\n\n", time.Now().UTC().Unix())
+			_ = writeSSE(w, "ping", map[string]any{"ts": time.Now().UTC().Unix()})
 			flusher.Flush()
 		}
 	}
@@ -275,4 +587,194 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+func decodeJSONBody(r *http.Request, out any) error {
+	if r.Body == nil {
+		return nil
+	}
+	defer r.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return nil
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return err
+	}
+	return nil
+}
+
+func decodePartData(p session.Part) (any, string) {
+	switch p.Type {
+	case session.PartTypeText:
+		var d session.TextData
+		if err := json.Unmarshal(p.Data, &d); err == nil {
+			return d, ""
+		}
+	case session.PartTypeReasoning:
+		var d session.ReasoningData
+		if err := json.Unmarshal(p.Data, &d); err == nil {
+			return d, ""
+		}
+	case session.PartTypeToolUse:
+		var d session.ToolUseData
+		if err := json.Unmarshal(p.Data, &d); err == nil {
+			return d, ""
+		}
+	case session.PartTypeToolResult:
+		var d session.ToolResultData
+		if err := json.Unmarshal(p.Data, &d); err == nil {
+			return d, ""
+		}
+	case session.PartTypeFile:
+		var d session.FileData
+		if err := json.Unmarshal(p.Data, &d); err == nil {
+			return d, ""
+		}
+	case session.PartTypeCompaction:
+		var d session.CompactionData
+		if err := json.Unmarshal(p.Data, &d); err == nil {
+			return d, ""
+		}
+	case session.PartTypeTodo:
+		var d session.TodoData
+		if err := json.Unmarshal(p.Data, &d); err == nil {
+			return d, ""
+		}
+	}
+
+	var generic any
+	if err := json.Unmarshal(p.Data, &generic); err == nil {
+		return generic, ""
+	}
+	return nil, string(p.Data)
+}
+
+func (s *Server) publishEvent(sessionID, name string, payload any) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+
+	s.mu.RLock()
+	subs := s.subs[sessionID]
+	chans := make([]chan streamedEvent, 0, len(subs))
+	for _, ch := range subs {
+		chans = append(chans, ch)
+	}
+	s.mu.RUnlock()
+
+	evt := streamedEvent{Name: name, Data: payload}
+	for _, ch := range chans {
+		select {
+		case ch <- evt:
+		default:
+		}
+	}
+}
+
+func (s *Server) subscribeSession(sessionID string) (<-chan streamedEvent, func()) {
+	ch := make(chan streamedEvent, 128)
+
+	s.mu.Lock()
+	id := s.nextID
+	s.nextID++
+	if s.subs[sessionID] == nil {
+		s.subs[sessionID] = make(map[uint64]chan streamedEvent)
+	}
+	s.subs[sessionID][id] = ch
+	s.mu.Unlock()
+
+	cancel := func() {
+		s.mu.Lock()
+		if subs, ok := s.subs[sessionID]; ok {
+			if _, ok := subs[id]; ok {
+				delete(subs, id)
+			}
+			if len(subs) == 0 {
+				delete(s.subs, sessionID)
+			}
+		}
+		s.mu.Unlock()
+	}
+
+	return ch, cancel
+}
+
+func writeSSE(w http.ResponseWriter, eventName string, data any) error {
+	if strings.TrimSpace(eventName) == "" {
+		eventName = "message"
+	}
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\n", eventName); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+		return err
+	}
+	return nil
+}
+
+func defaultAgentFactory(store session.Store) AgentFactory {
+	return func(_ context.Context, args AgentFactoryArgs) (AgentRunner, error) {
+		cfg := args.Config
+		if cfg == nil {
+			loaded, err := config.Load(args.WorkDir)
+			if err != nil {
+				return nil, fmt.Errorf("load config: %w", err)
+			}
+			cfg = loaded
+		}
+
+		model := strings.TrimSpace(args.Model)
+		if model == "" {
+			model = cfg.Model
+		}
+		providerName, modelID := splitModel(model)
+
+		var p provider.Provider
+		switch providerName {
+		case "openai", "groq", "openrouter", "together":
+			p = openaiProvider.NewCompatible(providerName, strings.Title(providerName), "", "")
+		case "google", "gemini":
+			p = googleProvider.New("")
+		default:
+			p = anthropicProvider.New("", "")
+		}
+
+		systemPrompt := cfg.Instructions
+		if systemPrompt == "" {
+			systemPrompt = "You are kvach, an AI coding agent. You have access to tools for reading files, writing files, executing shell commands, and searching code. Use them to help the user."
+		}
+
+		a := agent.New(p, tool.DefaultRegistry, store, agent.Config{
+			MaxTurns:     cfg.MaxTurns,
+			WorkDir:      args.WorkDir,
+			SystemPrompt: systemPrompt,
+			Model:        modelID,
+		})
+		return a, nil
+	}
+}
+
+func splitModel(model string) (providerName, modelID string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "anthropic", "claude-sonnet-4-5"
+	}
+	if i := strings.IndexByte(model, '/'); i > 0 {
+		return strings.ToLower(model[:i]), model[i+1:]
+	}
+	if strings.HasPrefix(model, "gpt-") || strings.HasPrefix(model, "o") {
+		return "openai", model
+	}
+	if strings.HasPrefix(model, "gemini") {
+		return "google", model
+	}
+	return "anthropic", model
 }
