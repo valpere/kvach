@@ -1,0 +1,14 @@
+# fix-review configuration
+#
+# Controls which severity levels are auto-fixed vs skipped.
+
+# Minimum severity to auto-fix. Findings below this level are reported
+# but not fixed. Options: critical, high, medium, low
+min_severity: medium
+
+# Maximum number of fix attempts per finding before giving up.
+max_attempts_per_finding: 3
+
+# Whether to run tests after each file group (true) or only at the end (false).
+# Per-group is safer but slower.
+test_after_each_group: true
