@@ -1,0 +1,29 @@
+{
+  "name": "kvach",
+  "version": "1.0.0",
+  "description": "AI coding agent in Go — tooling and project configuration",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "prepare": "husky",
+    "commitlint": "commitlint --edit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/valpere/kvach.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/valpere/kvach/issues"
+  },
+  "homepage": "https://github.com/valpere/kvach#readme",
+  "devDependencies": {
+    "@commitlint/cli": "^20.5.0",
+    "@commitlint/config-conventional": "^20.5.0",
+    "husky": "^9.1.7"
+  }
+}
