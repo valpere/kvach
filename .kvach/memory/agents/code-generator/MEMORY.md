@@ -1,5 +1,8 @@
 # Code Generator Agent Memory
 
+## Workflow
+- [project_pr_workflow.md](project_pr_workflow.md) — PR workflow: branch -> commit -> push -> PR -> review -> wait for Copilot -> fix comments -> merge. NEVER merge without Copilot review.
+
 ## Import rules
 - [project_import_rules.md](project_import_rules.md) — tool/ packages must NOT import provider/ types. Tool results are plain strings. Interfaces live in consumer package (e.g. skill.Loader in skill/, not tool/skill/). No import cycles.
 
