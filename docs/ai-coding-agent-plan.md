@@ -120,7 +120,7 @@ The analogy from the Claude Code source is apt: **brain-in-body**. The LLM is th
                     │   (QueryEngine equiv.)  │
                     └──┬──────────────────┬───┘
                        │                  │
-         ┌─────────────▼───┐    ┌──────────▼───────────┐
+         ┌─────────────▼───┐    ┌─────────▼────────────┐
          │  Provider Layer │    │    Tool Dispatcher   │
          │ (LLM API calls) │    │ (execute tools,      │
          │  Anthropic      │    │  permissions,        │
@@ -898,36 +898,68 @@ type TaskInput struct {
 }
 ```
 
-**Subagent interface:**
+**Subagent interface (implemented in `internal/multiagent/multiagent.go`):**
 ```go
-type SubagentRunner interface {
-    Run(ctx context.Context, opts SubagentOptions) (SubagentResult, error)
+type Runner interface {
+    Run(ctx context.Context, opts Options) (Result, error)
+    Status(ctx context.Context, taskID string) (TaskState, error)
+    Cancel(ctx context.Context, taskID string) error
 }
 
-type SubagentOptions struct {
-    Prompt      string
-    AgentName   string
-    Tools       []string  // restrict available tools
-    WorkDir     string
-    ParentID    string    // for lineage tracking
-    MaxTurns    int
+type Options struct {
+    TaskID          string        // resume existing task
+    Type            SubagentType  // in_process, teammate, worktree
+    Profile         string        // "general", "explore", etc.
+    Description     string        // short UI label
+    Prompt          string        // full instructions
+    AllowedTools    []string      // restrict from profile
+    DeniedTools     []string      // further restrict
+    WorkDir         string
+    ParentSessionID string
+    MaxTurns        int
+    MaxDuration     time.Duration
+    Metadata        map[string]string
 }
 
-type SubagentResult struct {
-    Output    string
-    SessionID string
-    Usage     Usage
-    Cost      float64
+type Result struct {
+    TaskID     string
+    State      TaskState  // queued, running, completed, failed, cancelled, timeout
+    Output     string
+    Contract   OutputContract  // summary, findings, changed_files, next_actions
+    SessionID  string
+    Duration   time.Duration
+    Usage      Usage  // input/output tokens, cost
+    Error      string
 }
 ```
+
+**Agent profiles (implemented in `internal/agent/profile.go`):**
+
+Agent profiles define named specialist configurations. Built-in profiles
+(`general`, `explore`, `build`, `review`) are registered at init. User profiles
+are loaded from `.kvach/agents/*.md` with YAML frontmatter:
+
+```yaml
+---
+name: code-generator
+tools: Read, Write, Edit, Glob, Grep, Bash, WebFetch, Task, Skill, Question
+model: anthropic/claude-sonnet-4-5
+color: yellow
+memory: agent
+---
+System prompt body...
+```
+
+The profile registry supports allow/deny tool lists, model override, memory
+scope (project vs per-agent), and validation.
 
 **Coordinator mode** (multi-agent orchestration):
 A special operating mode where the primary agent acts as an orchestrator only — it spawns and coordinates worker subagents but does not do implementation itself. Activated by config/env var. The coordinator gets a specialized system prompt replacing the default.
 
 **Communication:**
-- Workers return results as XML-tagged messages: `<task-notification>result</task-notification>`
-- Coordinator uses `SendMessage` tool to send follow-ups to specific workers (by name/ID)
-- Coordinator uses `TaskStop` tool to terminate the orchestration
+- Workers return results as structured `OutputContract` (summary, findings, changed files, next actions)
+- Coordinator uses `Task` tool to spawn and resume workers
+- Task lifecycle states: `queued`, `running`, `completed`, `failed`, `cancelled`, `timeout`
 
 ### 4.11 Skill System
 
@@ -958,22 +990,31 @@ When writing Go code:
 ./skills/
 ```
 
-**Skill loading:**
+**Skill loading (implemented in `internal/skill/skill.go`):**
 ```go
-type SkillLoader interface {
-    Discover(dirs []string) ([]Skill, error)
-    Load(path string) (Skill, error)
-    LoadFromURL(url string) (Skill, error)
+type Loader interface {
+    Discover(projectDir string, extraDirs []string) ([]CatalogEntry, error)
+    Activate(name string) (*Skill, error)
+    ParseFile(path string) (*Skill, error)
 }
 
 type Skill struct {
-    Name        string
-    Description string
-    WhenToUse   string
-    Location    string // file path or URL
-    Content     string // markdown body
+    Frontmatter              // name, description, license, compatibility, metadata, allowed-tools
+    Location    string       // absolute path to SKILL.md
+    BaseDir     string       // skill root directory
+    Body        string       // Markdown content (Tier 2)
+    Resources   []string     // scripts/, references/, assets/ (Tier 3)
+    Config      map[string]any // parsed config.yaml companion
+    ConfigPath  string       // path to companion config
+    Libraries   []string     // lib/ helper scripts
+    Source      string       // user-client, project-agents, etc.
 }
 ```
+
+Discovery scans user (`~/.kvach/skills/`, `~/.agents/skills/`) and project
+(`.kvach/skills/`, `.agents/skills/`) scopes. Project overrides user on name
+collision. The `activate_skill` tool returns structured `<skill_content>` XML
+with config summary, library listing, and resource listing.
 
 The `Skill` tool allows the LLM to request and load a skill into its context on demand rather than pre-loading all skills (which would waste tokens).
 

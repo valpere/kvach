@@ -20,6 +20,7 @@ const KNOWN_SCOPES = [
   'agent',
   'loop',
   'compaction',
+  'prompt',
 
   // Tool system
   'tool',
@@ -69,6 +70,8 @@ const KNOWN_SCOPES = [
   'ci',
   'docs',
   'release',
+  'agents',
+  'skills',
 ];
 
 module.exports = {
