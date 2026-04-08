@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -53,7 +54,7 @@ func init() {
 }
 
 func (m *multiEditTool) Name() string      { return "MultiEdit" }
-func (m *multiEditTool) Aliases() []string { return nil }
+func (m *multiEditTool) Aliases() []string { return []string{"multi_edit"} }
 
 func (m *multiEditTool) InputSchema() map[string]any {
 	return map[string]any{
@@ -90,7 +91,12 @@ func (m *multiEditTool) IsEnabled(_ *tool.Context) bool           { return true 
 func (m *multiEditTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 func (m *multiEditTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (m *multiEditTool) IsDestructive(_ json.RawMessage) bool     { return false }
-func (m *multiEditTool) Prompt(_ tool.PromptOptions) string       { return "" }
+func (m *multiEditTool) Prompt(_ tool.PromptOptions) string {
+	return `## MultiEdit tool
+
+Use MultiEdit to apply multiple exact-string replacements to one file in a single atomic call.
+Each old_string must match exactly once at the moment it is applied.`
+}
 
 func (m *multiEditTool) Call(_ context.Context, raw json.RawMessage, tctx *tool.Context) (*tool.Result, error) {
 	var in MultiEditInput
@@ -138,7 +144,7 @@ func (m *multiEditTool) Call(_ context.Context, raw json.RawMessage, tctx *tool.
 type applyPatchTool struct{}
 
 func (a *applyPatchTool) Name() string      { return "ApplyPatch" }
-func (a *applyPatchTool) Aliases() []string { return nil }
+func (a *applyPatchTool) Aliases() []string { return []string{"apply_patch"} }
 
 func (a *applyPatchTool) InputSchema() map[string]any {
 	return map[string]any{
@@ -163,9 +169,59 @@ func (a *applyPatchTool) IsEnabled(_ *tool.Context) bool           { return true
 func (a *applyPatchTool) IsConcurrencySafe(_ json.RawMessage) bool { return false }
 func (a *applyPatchTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (a *applyPatchTool) IsDestructive(_ json.RawMessage) bool     { return false }
-func (a *applyPatchTool) Prompt(_ tool.PromptOptions) string       { return "" }
+func (a *applyPatchTool) Prompt(_ tool.PromptOptions) string {
+	return `## ApplyPatch tool
 
-func (a *applyPatchTool) Call(_ context.Context, _ json.RawMessage, _ *tool.Context) (*tool.Result, error) {
-	// TODO(phase2): implement using a Go unified-diff library.
-	return &tool.Result{Content: "TODO: ApplyPatch tool not yet implemented"}, nil
+Use ApplyPatch to apply a unified diff patch across one or more files.
+The patch is applied relative to the working directory.`
+}
+
+func (a *applyPatchTool) Call(ctx context.Context, raw json.RawMessage, tctx *tool.Context) (*tool.Result, error) {
+	var in ApplyPatchInput
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil, fmt.Errorf("parse input: %w", err)
+	}
+	if strings.TrimSpace(in.Patch) == "" {
+		return nil, fmt.Errorf("patch is required")
+	}
+
+	workDir := ""
+	if tctx != nil {
+		workDir = strings.TrimSpace(tctx.WorkDir)
+	}
+	if workDir == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("resolve working directory: %w", err)
+		}
+		workDir = wd
+	}
+
+	tmpFile, err := os.CreateTemp(workDir, ".kvach-applypatch-*.diff")
+	if err != nil {
+		return nil, fmt.Errorf("create temp patch file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.WriteString(in.Patch); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("write temp patch file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("close temp patch file: %w", err)
+	}
+	defer os.Remove(tmpPath)
+
+	cmd := exec.CommandContext(ctx, "git", "-C", workDir, "apply", "--recount", "--whitespace=nowarn", "--", tmpPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return nil, fmt.Errorf("apply patch: %s", msg)
+	}
+
+	return &tool.Result{Content: "Patch applied successfully"}, nil
 }
