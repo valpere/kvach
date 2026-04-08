@@ -2,16 +2,10 @@ package cli
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/valpere/kvach/internal/agent"
-	"github.com/valpere/kvach/internal/config"
-	"github.com/valpere/kvach/internal/provider"
-	anthropicProvider "github.com/valpere/kvach/internal/provider/anthropic"
-	openaiProvider "github.com/valpere/kvach/internal/provider/openai"
-	"github.com/valpere/kvach/internal/tool"
 )
 
 func newRunCmd() *cobra.Command {
@@ -30,55 +24,14 @@ The agent runs the full agentic loop (including tool calls) and exits when compl
 			prompt := args[0]
 			ctx := cmd.Context()
 
-			// Resolve working directory.
-			workDir := globalFlags.WorkDir
-			if workDir == "" {
-				workDir, _ = os.Getwd()
-			}
-
-			// Load configuration.
-			cfg, err := config.Load(workDir)
+			runtime, err := newAgentRuntime(ctx)
 			if err != nil {
-				return fmt.Errorf("load config: %w", err)
+				return err
 			}
-
-			// Model selection: CLI flag > config > default.
-			model := cfg.Model
-			if globalFlags.Model != "" {
-				model = globalFlags.Model
-			}
-
-			providerName, modelID := splitModel(model)
-			var prov provider.Provider
-			switch providerName {
-			case "openai", "groq", "openrouter", "together":
-				prov = openaiProvider.NewCompatible(providerName, strings.Title(providerName), "", "")
-			default:
-				prov = anthropicProvider.New("", "")
-			}
-
-			store, err := openSessionStore(ctx)
-			if err != nil {
-				return fmt.Errorf("open session store: %w", err)
-			}
-			defer store.Close()
-
-			// Build system prompt from discovered instructions.
-			systemPrompt := cfg.Instructions
-			if systemPrompt == "" {
-				systemPrompt = "You are kvach, an AI coding agent. You have access to tools for reading files, writing files, executing shell commands, and searching code. Use them to help the user."
-			}
-
-			// Create the agent.
-			a := agent.New(prov, tool.DefaultRegistry, store, agent.Config{
-				MaxTurns:     cfg.MaxTurns,
-				WorkDir:      workDir,
-				SystemPrompt: systemPrompt,
-				Model:        modelID,
-			})
+			defer runtime.store.Close()
 
 			// Run and stream events to stdout.
-			events, err := a.Run(ctx, agent.RunOptions{
+			events, err := runtime.agent.Run(ctx, agent.RunOptions{
 				Prompt:    prompt,
 				SessionID: runFlags.SessionID,
 			})
