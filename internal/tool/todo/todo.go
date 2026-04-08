@@ -10,6 +10,8 @@ package todo
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	"github.com/valpere/kvach/internal/tool"
 )
@@ -91,8 +93,39 @@ func (t *todoTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *todoTool) IsDestructive(_ json.RawMessage) bool     { return false }
 func (t *todoTool) Prompt(_ tool.PromptOptions) string       { return "" }
 
-func (t *todoTool) Call(_ context.Context, _ json.RawMessage, _ *tool.Context) (*tool.Result, error) {
-	// TODO(phase2): store todos in the session state and emit a bus event
-	// so the TUI can render them.
-	return &tool.Result{Content: "TODO: TodoWrite tool not yet implemented"}, nil
+func (t *todoTool) Call(_ context.Context, raw json.RawMessage, _ *tool.Context) (*tool.Result, error) {
+	var in Input
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil, fmt.Errorf("parse input: %w", err)
+	}
+
+	// Validate items.
+	for i, item := range in.Todos {
+		if strings.TrimSpace(item.Content) == "" {
+			return nil, fmt.Errorf("todo %d: content is required", i)
+		}
+	}
+
+	// Build a summary of the todo list for the LLM response.
+	var b strings.Builder
+	counts := map[Status]int{}
+	for _, item := range in.Todos {
+		counts[item.Status]++
+	}
+	fmt.Fprintf(&b, "Todo list updated: %d items", len(in.Todos))
+	if c := counts[StatusCompleted]; c > 0 {
+		fmt.Fprintf(&b, ", %d completed", c)
+	}
+	if c := counts[StatusInProgress]; c > 0 {
+		fmt.Fprintf(&b, ", %d in progress", c)
+	}
+	if c := counts[StatusPending]; c > 0 {
+		fmt.Fprintf(&b, ", %d pending", c)
+	}
+	if c := counts[StatusCancelled]; c > 0 {
+		fmt.Fprintf(&b, ", %d cancelled", c)
+	}
+
+	// TODO(phase2): persist to session state and emit bus event for TUI.
+	return &tool.Result{Content: b.String()}, nil
 }

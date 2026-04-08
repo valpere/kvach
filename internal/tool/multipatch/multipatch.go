@@ -14,6 +14,10 @@ package multipatch
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/valpere/kvach/internal/tool"
 )
@@ -88,9 +92,45 @@ func (m *multiEditTool) IsReadOnly(_ json.RawMessage) bool        { return false
 func (m *multiEditTool) IsDestructive(_ json.RawMessage) bool     { return false }
 func (m *multiEditTool) Prompt(_ tool.PromptOptions) string       { return "" }
 
-func (m *multiEditTool) Call(_ context.Context, _ json.RawMessage, _ *tool.Context) (*tool.Result, error) {
-	// TODO(phase2): apply edits sequentially; roll back all on first failure.
-	return &tool.Result{Content: "TODO: MultiEdit tool not yet implemented"}, nil
+func (m *multiEditTool) Call(_ context.Context, raw json.RawMessage, tctx *tool.Context) (*tool.Result, error) {
+	var in MultiEditInput
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil, fmt.Errorf("parse input: %w", err)
+	}
+	if len(in.Edits) == 0 {
+		return nil, fmt.Errorf("at least one edit is required")
+	}
+
+	path := in.Path
+	if tctx != nil && tctx.WorkDir != "" && !filepath.IsAbs(path) {
+		path = filepath.Join(tctx.WorkDir, path)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", in.Path, err)
+	}
+
+	content := string(data)
+
+	// Apply edits sequentially. Each edit must match exactly once.
+	for i, edit := range in.Edits {
+		count := strings.Count(content, edit.OldString)
+		switch count {
+		case 0:
+			return nil, fmt.Errorf("edit %d: old_string not found in %s", i, in.Path)
+		case 1:
+			content = strings.Replace(content, edit.OldString, edit.NewString, 1)
+		default:
+			return nil, fmt.Errorf("edit %d: found %d matches for old_string in %s; provide more context", i, count, in.Path)
+		}
+	}
+
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return nil, fmt.Errorf("write %s: %w", in.Path, err)
+	}
+
+	return &tool.Result{Content: fmt.Sprintf("Applied %d edits to %s", len(in.Edits), in.Path)}, nil
 }
 
 // --- ApplyPatch ---
