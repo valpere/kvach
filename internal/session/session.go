@@ -55,6 +55,7 @@ const (
 	PartTypeToolResult PartType = "tool_result"
 	PartTypeFile       PartType = "file"
 	PartTypeCompaction PartType = "compaction"
+	PartTypeTodo       PartType = "todo"
 )
 
 // Part is a single content block within a [Message].
@@ -70,6 +71,7 @@ type Part struct {
 	//   PartTypeToolResult  -> ToolResultData
 	//   PartTypeFile        -> FileData
 	//   PartTypeCompaction  -> CompactionData
+	//   PartTypeTodo        -> TodoData
 	Data      []byte
 	CreatedAt time.Time
 }
@@ -110,6 +112,18 @@ type FileData struct {
 // CompactionData is the payload for PartTypeCompaction parts.
 type CompactionData struct {
 	Summary string `json:"summary"`
+}
+
+// TodoItemData is one persisted todo item from the TodoWrite tool.
+type TodoItemData struct {
+	Content  string `json:"content"`
+	Status   string `json:"status"`
+	Priority string `json:"priority"`
+}
+
+// TodoData is the payload for PartTypeTodo parts.
+type TodoData struct {
+	Todos []TodoItemData `json:"todos"`
 }
 
 // Store is the persistence interface for sessions and their messages.

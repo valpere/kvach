@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/valpere/kvach/internal/bus"
 	"github.com/valpere/kvach/internal/git"
 	"github.com/valpere/kvach/internal/memory"
 	"github.com/valpere/kvach/internal/multiagent"
@@ -30,6 +31,7 @@ type Agent struct {
 	registry *tool.Registry
 	sessions session.Store
 	tasks    multiagent.Runner
+	bus      *bus.Bus
 	config   Config
 }
 
@@ -67,6 +69,7 @@ func New(p provider.Provider, r *tool.Registry, s session.Store, cfg Config) *Ag
 		provider: p,
 		registry: r,
 		sessions: s,
+		bus:      bus.New(),
 		config:   cfg,
 	}
 	a.tasks = newSubagentRunner(a)
@@ -173,7 +176,7 @@ func (a *Agent) loop(ctx context.Context, opts RunOptions, events chan<- Event) 
 		}
 
 		// Execute tool calls and build result message.
-		resultParts := a.executeToolCalls(ctx, toolCalls, events)
+		resultParts := a.executeToolCalls(ctx, sessionID, toolCalls, events)
 
 		resultMsg := provider.Message{
 			Role:  "user",
@@ -374,10 +377,13 @@ func (a *Agent) processStream(stream <-chan provider.StreamEvent, events chan<- 
 }
 
 // executeToolCalls runs each tool call and returns the result parts.
-func (a *Agent) executeToolCalls(ctx context.Context, calls []toolCall, events chan<- Event) []provider.Part {
+func (a *Agent) executeToolCalls(ctx context.Context, sessionID string, calls []toolCall, events chan<- Event) []provider.Part {
 	tctx := &tool.Context{
-		WorkDir:    a.config.WorkDir,
-		TaskRunner: a.tasks,
+		SessionID:    sessionID,
+		WorkDir:      a.config.WorkDir,
+		TaskRunner:   a.tasks,
+		SessionStore: a.sessions,
+		EventBus:     a.bus,
 	}
 
 	var parts []provider.Part
