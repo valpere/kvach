@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -30,9 +29,7 @@ Use sub-commands for scripted or headless operation.`,
 	// SilenceUsage prevents cobra from printing usage on every error.
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// TODO(phase2): launch the bubbletea TUI.
-		fmt.Fprintln(cmd.OutOrStdout(), "kvach TUI — coming in Phase 2.")
-		return nil
+		return runTUI(cmd)
 	},
 }
 
