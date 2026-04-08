@@ -15,8 +15,12 @@
 package config
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/valpere/kvach/internal/hook"
@@ -155,13 +159,367 @@ func Load(projectDir string) (*Config, error) {
 	// Discover CLAUDE.md / AGENTS.md by walking upward from projectDir.
 	cfg.Instructions = discoverInstructions(projectDir)
 
-	// TODO(phase2): implement multi-source merge, JSONC parsing, env overrides.
-	// For now we load the model from KVACH_MODEL env if set.
-	if m := os.Getenv("KVACH_MODEL"); m != "" {
-		cfg.Model = m
+	paths := ResolvePaths()
+
+	systemConfigPath, err := firstExistingFile(
+		filepath.Join(paths.SystemConfig, "config.json"),
+		filepath.Join(paths.SystemConfig, "config.jsonc"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve system config: %w", err)
+	}
+	if systemConfigPath != "" {
+		if err := loadAndMergeFile(cfg, systemConfigPath); err != nil {
+			return nil, fmt.Errorf("load system config: %w", err)
+		}
+	}
+
+	globalConfigPath, err := firstExistingFile(
+		filepath.Join(paths.ConfigHome, "config.json"),
+		filepath.Join(paths.ConfigHome, "config.jsonc"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve user config: %w", err)
+	}
+	if globalConfigPath != "" {
+		if err := loadAndMergeFile(cfg, globalConfigPath); err != nil {
+			return nil, fmt.Errorf("load user config: %w", err)
+		}
+	}
+
+	projectConfigPath, err := firstExistingFile(
+		filepath.Join(projectDir, ".kvach", "config.json"),
+		filepath.Join(projectDir, ".kvach", "config.jsonc"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project config: %w", err)
+	}
+	if projectConfigPath != "" {
+		if err := loadAndMergeFile(cfg, projectConfigPath); err != nil {
+			return nil, fmt.Errorf("load project config: %w", err)
+		}
+	}
+
+	if err := applyEnvOverrides(cfg); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
+}
+
+func firstExistingFile(paths ...string) (string, error) {
+	for _, p := range paths {
+		st, err := os.Stat(p)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return "", fmt.Errorf("stat %s: %w", p, err)
+		}
+		if st.IsDir() {
+			continue
+		}
+		return p, nil
+	}
+	return "", nil
+}
+
+func loadAndMergeFile(cfg *Config, filePath string) error {
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", filePath, err)
+	}
+
+	jsonData, err := stripJSONComments(raw)
+	if err != nil {
+		return fmt.Errorf("parse %s as JSONC: %w", filePath, err)
+	}
+
+	var src Config
+	if err := json.Unmarshal(jsonData, &src); err != nil {
+		return fmt.Errorf("decode %s: %w", filePath, err)
+	}
+
+	mergeConfig(cfg, &src)
+	return nil
+}
+
+func applyEnvOverrides(cfg *Config) error {
+	if m := strings.TrimSpace(os.Getenv("KVACH_MODEL")); m != "" {
+		cfg.Model = m
+	}
+
+	if raw := strings.TrimSpace(os.Getenv("KVACH_MAX_TURNS")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("invalid KVACH_MAX_TURNS %q", raw)
+		}
+		cfg.MaxTurns = n
+	}
+
+	if raw := strings.TrimSpace(os.Getenv("KVACH_AUTO_MEMORY")); raw != "" {
+		b, err := strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("invalid KVACH_AUTO_MEMORY %q", raw)
+		}
+		cfg.AutoMemory = &b
+	}
+
+	if mode := strings.TrimSpace(os.Getenv("KVACH_PERMISSION_MODE")); mode != "" {
+		cfg.Permission.Mode = permission.Mode(mode)
+	}
+
+	if dirs := splitPathList(strings.TrimSpace(os.Getenv("KVACH_SKILL_DIRS"))); len(dirs) > 0 {
+		cfg.SkillDirs = dirs
+	}
+
+	if host := strings.TrimSpace(os.Getenv("KVACH_SERVER_HOST")); host != "" {
+		cfg.Server.Host = host
+	}
+
+	if raw := strings.TrimSpace(os.Getenv("KVACH_SERVER_PORT")); raw != "" {
+		p, err := strconv.Atoi(raw)
+		if err != nil || p <= 0 {
+			return fmt.Errorf("invalid KVACH_SERVER_PORT %q", raw)
+		}
+		cfg.Server.Port = p
+	}
+
+	return nil
+}
+
+func splitPathList(value string) []string {
+	if value == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == os.PathListSeparator || r == ','
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func mergeConfig(dst, src *Config) {
+	if src.Model != "" {
+		dst.Model = src.Model
+	}
+	if src.MaxTurns != 0 {
+		dst.MaxTurns = src.MaxTurns
+	}
+	if src.AutoMemory != nil {
+		b := *src.AutoMemory
+		dst.AutoMemory = &b
+	}
+
+	if src.Permission.Mode != "" {
+		dst.Permission.Mode = src.Permission.Mode
+	}
+	if len(src.Permission.Allow) > 0 {
+		dst.Permission.Allow = append([]permission.Rule(nil), src.Permission.Allow...)
+	}
+	if len(src.Permission.Deny) > 0 {
+		dst.Permission.Deny = append([]permission.Rule(nil), src.Permission.Deny...)
+	}
+
+	if len(src.SkillDirs) > 0 {
+		dst.SkillDirs = append([]string(nil), src.SkillDirs...)
+	}
+
+	if src.Server.Host != "" {
+		dst.Server.Host = src.Server.Host
+	}
+	if src.Server.Port != 0 {
+		dst.Server.Port = src.Server.Port
+	}
+	if src.Server.Password != "" {
+		dst.Server.Password = src.Server.Password
+	}
+
+	if src.Provider != nil {
+		if dst.Provider == nil {
+			dst.Provider = make(map[string]ProviderConfig)
+		}
+		for name, p := range src.Provider {
+			current, ok := dst.Provider[name]
+			if !ok {
+				dst.Provider[name] = p
+				continue
+			}
+			mergeProviderConfig(&current, &p)
+			dst.Provider[name] = current
+		}
+	}
+
+	if src.MCP.Servers != nil {
+		if dst.MCP.Servers == nil {
+			dst.MCP.Servers = make(map[string]mcp.ServerConfig)
+		}
+		for name, server := range src.MCP.Servers {
+			dst.MCP.Servers[name] = server
+		}
+	}
+
+	if src.Hooks != nil {
+		if dst.Hooks == nil {
+			dst.Hooks = make(map[string][]hook.Matcher)
+		}
+		for event, matchers := range src.Hooks {
+			dst.Hooks[event] = append([]hook.Matcher(nil), matchers...)
+		}
+	}
+
+	if src.Agents != nil {
+		if dst.Agents == nil {
+			dst.Agents = make(map[string]AgentConfig)
+		}
+		for name, agentCfg := range src.Agents {
+			current, ok := dst.Agents[name]
+			if !ok {
+				dst.Agents[name] = agentCfg
+				continue
+			}
+			mergeAgentConfig(&current, &agentCfg)
+			dst.Agents[name] = current
+		}
+	}
+}
+
+func mergeProviderConfig(dst, src *ProviderConfig) {
+	if src.APIKey != "" {
+		dst.APIKey = src.APIKey
+	}
+	if src.BaseURL != "" {
+		dst.BaseURL = src.BaseURL
+	}
+
+	if src.Models != nil {
+		if dst.Models == nil {
+			dst.Models = make(map[string]ModelOverride)
+		}
+		for name, model := range src.Models {
+			current, ok := dst.Models[name]
+			if !ok {
+				dst.Models[name] = model
+				continue
+			}
+			mergeModelOverride(&current, &model)
+			dst.Models[name] = current
+		}
+	}
+}
+
+func mergeModelOverride(dst, src *ModelOverride) {
+	if src.Name != "" {
+		dst.Name = src.Name
+	}
+	if src.ContextTokens != 0 {
+		dst.ContextTokens = src.ContextTokens
+	}
+	if src.MaxOutputTokens != 0 {
+		dst.MaxOutputTokens = src.MaxOutputTokens
+	}
+	if src.InputCostPer1M != 0 {
+		dst.InputCostPer1M = src.InputCostPer1M
+	}
+	if src.OutputCostPer1M != 0 {
+		dst.OutputCostPer1M = src.OutputCostPer1M
+	}
+}
+
+func mergeAgentConfig(dst, src *AgentConfig) {
+	if src.Description != "" {
+		dst.Description = src.Description
+	}
+	if src.Model != "" {
+		dst.Model = src.Model
+	}
+	if src.Prompt != "" {
+		dst.Prompt = src.Prompt
+	}
+	if src.MaxTurns != 0 {
+		dst.MaxTurns = src.MaxTurns
+	}
+	if src.Disabled {
+		dst.Disabled = true
+	}
+}
+
+func stripJSONComments(data []byte) ([]byte, error) {
+	out := make([]byte, 0, len(data))
+	inString := false
+	escaped := false
+	inLineComment := false
+	inBlockComment := false
+
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+
+		if inLineComment {
+			if c == '\n' {
+				inLineComment = false
+				out = append(out, c)
+			}
+			continue
+		}
+
+		if inBlockComment {
+			if c == '*' && i+1 < len(data) && data[i+1] == '/' {
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+
+		if inString {
+			out = append(out, c)
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+
+		if c == '"' {
+			inString = true
+			out = append(out, c)
+			continue
+		}
+
+		if c == '/' && i+1 < len(data) {
+			next := data[i+1]
+			if next == '/' {
+				inLineComment = true
+				i++
+				continue
+			}
+			if next == '*' {
+				inBlockComment = true
+				i++
+				continue
+			}
+		}
+
+		out = append(out, c)
+	}
+
+	if inBlockComment {
+		return nil, errors.New("unterminated block comment")
+	}
+
+	return out, nil
 }
 
 // discoverInstructions walks upward from dir to /, collecting CLAUDE.md and
@@ -218,10 +576,15 @@ func ResolvePaths() Paths {
 		cacheHome = filepath.Join(home, ".cache")
 	}
 
+	systemConfig := os.Getenv("KVACH_SYSTEM_CONFIG")
+	if systemConfig == "" {
+		systemConfig = "/etc/kvach"
+	}
+
 	return Paths{
 		ConfigHome:   filepath.Join(configHome, "kvach"),
 		DataHome:     filepath.Join(dataHome, "kvach"),
 		CacheHome:    filepath.Join(cacheHome, "kvach"),
-		SystemConfig: "/etc/kvach",
+		SystemConfig: systemConfig,
 	}
 }
