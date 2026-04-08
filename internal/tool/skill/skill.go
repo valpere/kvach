@@ -28,6 +28,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+
+	skillpkg "github.com/valpere/kvach/internal/skill"
 
 	"github.com/valpere/kvach/internal/tool"
 )
@@ -85,6 +88,8 @@ type skillTool struct {
 	// validNames is the set of known skill names at session construction time.
 	// Used to build the enum constraint in the input schema.
 	validNames []string
+	entries    map[string]CatalogEntry
+	loader     skillpkg.Loader
 	// activated tracks names already injected in this session to skip re-injection.
 	activated map[string]bool
 }
@@ -131,7 +136,11 @@ func (s *skillTool) CheckPermissions(_ json.RawMessage, _ *tool.Context) tool.Pe
 // "If no skills are discovered, don't register the tool at all."
 // In practice we register but disable; the session builder filters disabled
 // tools from the pool it sends to the LLM.
-func (s *skillTool) IsEnabled(_ *tool.Context) bool {
+func (s *skillTool) IsEnabled(tctx *tool.Context) bool {
+	if len(s.validNames) > 0 {
+		return true
+	}
+	_ = s.ensureCatalog(tctx)
 	return len(s.validNames) > 0
 }
 
@@ -145,10 +154,16 @@ func (s *skillTool) Prompt(_ tool.PromptOptions) string { return "" }
 // <skill_content> structured tags, per the spec. If the skill was already
 // activated in this session it returns a short acknowledgement instead of
 // re-injecting the full content.
-func (s *skillTool) Call(_ context.Context, raw json.RawMessage, _ *tool.Context) (*tool.Result, error) {
+func (s *skillTool) Call(_ context.Context, raw json.RawMessage, tctx *tool.Context) (*tool.Result, error) {
 	var in Input
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, err
+	}
+	if err := s.ensureCatalog(tctx); err != nil {
+		return nil, err
+	}
+	if _, ok := s.entries[in.Name]; !ok {
+		return nil, fmt.Errorf("unknown skill %q", in.Name)
 	}
 
 	// Deduplication: spec says "if the model attempts to load a skill already
@@ -163,15 +178,48 @@ func (s *skillTool) Call(_ context.Context, raw json.RawMessage, _ *tool.Context
 	}
 	s.activated[in.Name] = true
 
-	// TODO(phase2): look up the skill via the session's Loader, call
-	// Loader.Activate(in.Name), and return skill.ActivationXML().
-	//
-	// Placeholder — returns the structured wrapper with a stub body so the
-	// XML format is testable before Loader is wired up.
-	return &tool.Result{
-		Content: fmt.Sprintf(
-			"<skill_content name=%q>\nSkill instructions not yet loaded (Loader not wired).\n\nSkill directory: (unknown)\n</skill_content>",
-			in.Name,
-		),
-	}, nil
+	sk, err := s.loader.Activate(in.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tool.Result{Content: sk.ActivationXML()}, nil
+}
+
+func (s *skillTool) ensureCatalog(tctx *tool.Context) error {
+	if len(s.validNames) > 0 && s.entries != nil && s.loader != nil {
+		return nil
+	}
+
+	projectDir := "."
+	if tctx != nil {
+		if tctx.WorkDir != "" {
+			projectDir = tctx.WorkDir
+		}
+		if loader, ok := tctx.SkillLoader.(skillpkg.Loader); ok {
+			s.loader = loader
+		}
+	}
+
+	if s.loader == nil {
+		homeDir, _ := os.UserHomeDir()
+		s.loader = skillpkg.NewFSLoader(homeDir)
+	}
+
+	entries, err := s.loader.Discover(projectDir, nil)
+	if err != nil {
+		return err
+	}
+
+	s.validNames = s.validNames[:0]
+	s.entries = make(map[string]CatalogEntry, len(entries))
+	for _, e := range entries {
+		s.validNames = append(s.validNames, e.Name)
+		s.entries[e.Name] = CatalogEntry{
+			Name:        e.Name,
+			Description: e.Description,
+			Location:    e.Location,
+		}
+	}
+	return nil
 }

@@ -113,7 +113,7 @@ func (t *taskTool) IsReadOnly(_ json.RawMessage) bool        { return false }
 func (t *taskTool) IsDestructive(_ json.RawMessage) bool     { return false }
 func (t *taskTool) Prompt(_ tool.PromptOptions) string       { return "" }
 
-func (t *taskTool) Call(_ context.Context, raw json.RawMessage, _ *tool.Context) (*tool.Result, error) {
+func (t *taskTool) Call(ctx context.Context, raw json.RawMessage, tctx *tool.Context) (*tool.Result, error) {
 	var in Input
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, err
@@ -126,6 +126,49 @@ func (t *taskTool) Call(_ context.Context, raw json.RawMessage, _ *tool.Context)
 	resume := "new"
 	if strings.TrimSpace(in.TaskID) != "" {
 		resume = "resume"
+	}
+
+	runner, ok := any(nil), false
+	if tctx != nil && tctx.TaskRunner != nil {
+		runner, ok = tctx.TaskRunner, true
+	}
+	if ok {
+		if r, ok := runner.(multiagent.Runner); ok {
+			opts := multiagent.Options{
+				TaskID:      strings.TrimSpace(in.TaskID),
+				Profile:     profile,
+				Description: in.Description,
+				Prompt:      in.Prompt,
+				Command:     in.Command,
+			}
+			opts.Normalize()
+			if err := opts.Validate(); err != nil {
+				return nil, err
+			}
+
+			res, err := r.Run(ctx, opts)
+			if err != nil {
+				return nil, err
+			}
+
+			content := res.Output
+			if strings.TrimSpace(content) == "" {
+				content = res.Contract.Raw
+			}
+			if strings.TrimSpace(content) == "" {
+				content = fmt.Sprintf(
+					"Task %s (%s) completed with state=%s\nSummary: %s\nFindings: %d\nChanged files: %d\nNext actions: %d",
+					res.TaskID,
+					res.Profile,
+					res.State,
+					res.Contract.Summary,
+					len(res.Contract.Findings),
+					len(res.Contract.ChangedFiles),
+					len(res.Contract.NextActions),
+				)
+			}
+			return &tool.Result{Content: content}, nil
+		}
 	}
 
 	// TODO(phase2): wire up multiagent.Runner and return the real subagent
