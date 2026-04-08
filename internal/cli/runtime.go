@@ -8,6 +8,7 @@ import (
 
 	"github.com/valpere/kvach/internal/agent"
 	"github.com/valpere/kvach/internal/config"
+	"github.com/valpere/kvach/internal/git"
 	"github.com/valpere/kvach/internal/provider"
 	anthropicProvider "github.com/valpere/kvach/internal/provider/anthropic"
 	openaiProvider "github.com/valpere/kvach/internal/provider/openai"
@@ -19,6 +20,8 @@ type agentRuntime struct {
 	agent     *agent.Agent
 	store     *session.SQLiteStore
 	fullModel string
+	workDir   string
+	projectID string
 }
 
 func newAgentRuntime(ctx context.Context) (*agentRuntime, error) {
@@ -51,6 +54,11 @@ func newAgentRuntime(ctx context.Context) (*agentRuntime, error) {
 		return nil, fmt.Errorf("open session store: %w", err)
 	}
 
+	projectID := git.SlugFromRoot(workDir)
+	if root, err := git.Root(ctx, workDir); err == nil {
+		projectID = git.SlugFromRoot(root)
+	}
+
 	systemPrompt := cfg.Instructions
 	if systemPrompt == "" {
 		systemPrompt = "You are kvach, an AI coding agent. You have access to tools for reading files, writing files, executing shell commands, and searching code. Use them to help the user."
@@ -67,5 +75,20 @@ func newAgentRuntime(ctx context.Context) (*agentRuntime, error) {
 		agent:     a,
 		store:     store,
 		fullModel: model,
+		workDir:   workDir,
+		projectID: projectID,
 	}, nil
+}
+
+func (r *agentRuntime) latestSessionID(ctx context.Context) (string, error) {
+	sessions, err := r.store.ListSessions(ctx, r.projectID)
+	if err != nil {
+		return "", err
+	}
+	for _, sess := range sessions {
+		if sess.ArchivedAt == nil {
+			return sess.ID, nil
+		}
+	}
+	return "", session.ErrNotFound
 }

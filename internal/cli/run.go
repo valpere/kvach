@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/valpere/kvach/internal/agent"
+	"github.com/valpere/kvach/internal/session"
 )
 
 func newRunCmd() *cobra.Command {
@@ -23,6 +26,7 @@ The agent runs the full agentic loop (including tool calls) and exits when compl
 		RunE: func(cmd *cobra.Command, args []string) error {
 			prompt := args[0]
 			ctx := cmd.Context()
+			out := cmd.OutOrStdout()
 
 			runtime, err := newAgentRuntime(ctx)
 			if err != nil {
@@ -30,16 +34,23 @@ The agent runs the full agentic loop (including tool calls) and exits when compl
 			}
 			defer runtime.store.Close()
 
+			sessionID, err := resolveRunSessionID(ctx, runtime, runFlags.SessionID, runFlags.Continue)
+			if err != nil {
+				return err
+			}
+			if globalFlags.Debug && sessionID != "" {
+				fmt.Fprintf(out, "[session] using %s\n", sessionID)
+			}
+
 			// Run and stream events to stdout.
 			events, err := runtime.agent.Run(ctx, agent.RunOptions{
 				Prompt:    prompt,
-				SessionID: runFlags.SessionID,
+				SessionID: sessionID,
 			})
 			if err != nil {
 				return fmt.Errorf("run agent: %w", err)
 			}
 
-			out := cmd.OutOrStdout()
 			for evt := range events {
 				switch evt.Type {
 				case agent.EventTextDelta:
@@ -78,6 +89,28 @@ The agent runs the full agentic loop (including tool calls) and exits when compl
 	cmd.Flags().StringVar(&runFlags.SessionID, "resume", "", "Resume an existing session by ID")
 	cmd.Flags().BoolVar(&runFlags.Continue, "continue", false, "Continue the most recent session")
 	return cmd
+}
+
+func resolveRunSessionID(ctx context.Context, runtime *agentRuntime, resumeSessionID string, continueLatest bool) (string, error) {
+	resumeSessionID = strings.TrimSpace(resumeSessionID)
+	if resumeSessionID != "" && continueLatest {
+		return "", fmt.Errorf("--resume and --continue are mutually exclusive")
+	}
+	if resumeSessionID != "" {
+		return resumeSessionID, nil
+	}
+	if !continueLatest {
+		return "", nil
+	}
+
+	sessionID, err := runtime.latestSessionID(ctx)
+	if err != nil {
+		if errors.Is(err, session.ErrNotFound) {
+			return "", fmt.Errorf("no previous sessions found for this project")
+		}
+		return "", fmt.Errorf("resolve latest session: %w", err)
+	}
+	return sessionID, nil
 }
 
 func splitModel(model string) (providerName, modelID string) {
