@@ -54,6 +54,9 @@ type Server struct {
 	runMu   sync.RWMutex
 	runs    map[string]activePromptRun
 	history map[string][]runInfo
+
+	permMu            sync.RWMutex
+	pendingPermission map[string]map[string]pendingPermission
 }
 
 // Options configures server dependencies.
@@ -70,9 +73,11 @@ type AgentRunner interface {
 
 // AgentFactoryArgs are inputs for creating an AgentRunner.
 type AgentFactoryArgs struct {
-	WorkDir string
-	Model   string
-	Config  *config.Config
+	WorkDir         string
+	Model           string
+	SessionID       string
+	PermissionAsker permission.Asker
+	Config          *config.Config
 }
 
 // AgentFactory creates an agent runner for request-scoped execution.
@@ -90,6 +95,11 @@ type activePromptRun struct {
 	Model     string
 	Prompt    string
 	SessionID string
+}
+
+type pendingPermission struct {
+	Request permission.Request
+	Reply   chan permission.Reply
 }
 
 type runStatus string
@@ -124,13 +134,14 @@ func New(cfg config.ServerConfig, opts Options) *Server {
 	}
 
 	s := &Server{
-		cfg:      cfg,
-		workDir:  opts.WorkDir,
-		sessions: opts.SessionStore,
-		newAgent: factory,
-		subs:     make(map[string]map[uint64]chan streamedEvent),
-		runs:     make(map[string]activePromptRun),
-		history:  make(map[string][]runInfo),
+		cfg:               cfg,
+		workDir:           opts.WorkDir,
+		sessions:          opts.SessionStore,
+		newAgent:          factory,
+		subs:              make(map[string]map[uint64]chan streamedEvent),
+		runs:              make(map[string]activePromptRun),
+		history:           make(map[string][]runInfo),
+		pendingPermission: make(map[string]map[string]pendingPermission),
 	}
 	s.router = s.buildRouter()
 	return s
@@ -179,6 +190,7 @@ func (s *Server) buildRouter() http.Handler {
 	mux.HandleFunc("GET /session/{id}/messages", s.handleSessionMessages)
 	mux.HandleFunc("POST /session/{id}/prompt", s.handleSessionPrompt)
 	mux.HandleFunc("POST /session/{id}/cancel", s.handleSessionCancel)
+	mux.HandleFunc("POST /session/{id}/permission/{requestID}/resolve", s.handlePermissionResolve)
 	mux.HandleFunc("GET /session/{id}/events", s.handleSessionEvents)
 	return mux
 }
@@ -572,6 +584,18 @@ type cancelResponse struct {
 	Cancelled bool   `json:"cancelled"`
 }
 
+type resolvePermissionRequest struct {
+	Decision string `json:"decision"`
+	Pattern  string `json:"pattern,omitempty"`
+}
+
+type resolvePermissionResponse struct {
+	SessionID string `json:"session_id"`
+	RequestID string `json:"request_id"`
+	Decision  string `json:"decision"`
+	Resolved  bool   `json:"resolved"`
+}
+
 func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 	if s.sessions == nil {
 		http.Error(w, "session store unavailable", http.StatusServiceUnavailable)
@@ -625,7 +649,13 @@ func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 		cfg.MaxTurns = req.MaxTurns
 	}
 
-	runner, err := s.newAgent(r.Context(), AgentFactoryArgs{WorkDir: workDir, Model: cfg.Model, Config: cfg})
+	runner, err := s.newAgent(r.Context(), AgentFactoryArgs{
+		WorkDir:         workDir,
+		Model:           cfg.Model,
+		SessionID:       id,
+		PermissionAsker: s.newPermissionAsker(id),
+		Config:          cfg,
+	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("create agent: %v", err), http.StatusInternalServerError)
 		return
@@ -781,6 +811,61 @@ func (s *Server) handleSessionCancel(w http.ResponseWriter, r *http.Request) {
 		SessionID: id,
 		RunID:     run.RunID,
 		Cancelled: true,
+	})
+}
+
+func (s *Server) handlePermissionResolve(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		http.Error(w, "session id is required", http.StatusBadRequest)
+		return
+	}
+	requestID := strings.TrimSpace(r.PathValue("requestID"))
+	if requestID == "" {
+		http.Error(w, "request id is required", http.StatusBadRequest)
+		return
+	}
+
+	if s.sessions != nil {
+		if _, err := s.sessions.GetSession(r.Context(), id); err != nil {
+			if err == session.ErrNotFound {
+				http.Error(w, "session not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, fmt.Sprintf("get session: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	var req resolvePermissionRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+	decision := strings.ToLower(strings.TrimSpace(req.Decision))
+	switch decision {
+	case "allow_once", "allow_always", "deny":
+	default:
+		http.Error(w, "decision must be allow_once, allow_always, or deny", http.StatusBadRequest)
+		return
+	}
+
+	pattern := strings.TrimSpace(req.Pattern)
+	if pattern == "" {
+		pattern = "*"
+	}
+	reply := permission.Reply{Decision: decision, ToolName: "", Pattern: pattern}
+
+	if !s.resolvePendingPermission(id, requestID, reply) {
+		http.Error(w, "pending permission request not found", http.StatusNotFound)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resolvePermissionResponse{
+		SessionID: id,
+		RequestID: requestID,
+		Decision:  decision,
+		Resolved:  true,
 	})
 }
 
@@ -1034,6 +1119,90 @@ func (s *Server) listRuns(sessionID string) (*runInfo, []runInfo) {
 	return active, history
 }
 
+type serverPermissionAsker struct {
+	server    *Server
+	sessionID string
+}
+
+func (s *Server) newPermissionAsker(sessionID string) permission.Asker {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	return &serverPermissionAsker{server: s, sessionID: sessionID}
+}
+
+func (a *serverPermissionAsker) Ask(ctx context.Context, req permission.Request) (permission.Reply, error) {
+	if a == nil || a.server == nil {
+		return permission.Reply{}, fmt.Errorf("permission asker is not configured")
+	}
+
+	if strings.TrimSpace(req.ID) == "" {
+		req.ID = "perm-" + uuid.NewString()
+	}
+	resp := make(chan permission.Reply, 1)
+	if !a.server.registerPendingPermission(a.sessionID, req, resp) {
+		return permission.Reply{}, fmt.Errorf("permission request %s already exists", req.ID)
+	}
+	defer a.server.removePendingPermission(a.sessionID, req.ID)
+
+	select {
+	case <-ctx.Done():
+		return permission.Reply{}, ctx.Err()
+	case reply := <-resp:
+		return reply, nil
+	}
+}
+
+func (s *Server) registerPendingPermission(sessionID string, req permission.Request, resp chan permission.Reply) bool {
+	s.permMu.Lock()
+	defer s.permMu.Unlock()
+	if s.pendingPermission[sessionID] == nil {
+		s.pendingPermission[sessionID] = make(map[string]pendingPermission)
+	}
+	if _, exists := s.pendingPermission[sessionID][req.ID]; exists {
+		return false
+	}
+	s.pendingPermission[sessionID][req.ID] = pendingPermission{Request: req, Reply: resp}
+	return true
+}
+
+func (s *Server) removePendingPermission(sessionID, requestID string) {
+	s.permMu.Lock()
+	defer s.permMu.Unlock()
+	if pending, ok := s.pendingPermission[sessionID]; ok {
+		delete(pending, requestID)
+		if len(pending) == 0 {
+			delete(s.pendingPermission, sessionID)
+		}
+	}
+}
+
+func (s *Server) resolvePendingPermission(sessionID, requestID string, reply permission.Reply) bool {
+	s.permMu.Lock()
+	pendingBySession, ok := s.pendingPermission[sessionID]
+	if !ok {
+		s.permMu.Unlock()
+		return false
+	}
+	pending, ok := pendingBySession[requestID]
+	if !ok {
+		s.permMu.Unlock()
+		return false
+	}
+	delete(pendingBySession, requestID)
+	if len(pendingBySession) == 0 {
+		delete(s.pendingPermission, sessionID)
+	}
+	s.permMu.Unlock()
+
+	select {
+	case pending.Reply <- reply:
+		return true
+	default:
+		return false
+	}
+}
+
 func parseRunsQuery(r *http.Request) (runsQuery, error) {
 	q := runsQuery{Limit: maxRunHistory, Offset: 0}
 
@@ -1211,10 +1380,11 @@ func defaultAgentFactory(store session.Store) AgentFactory {
 		}
 
 		a := agent.New(p, tool.DefaultRegistry, store, agent.Config{
-			MaxTurns:     cfg.MaxTurns,
-			WorkDir:      args.WorkDir,
-			SystemPrompt: systemPrompt,
-			Model:        modelID,
+			MaxTurns:        cfg.MaxTurns,
+			WorkDir:         args.WorkDir,
+			SystemPrompt:    systemPrompt,
+			Model:           modelID,
+			PermissionAsker: args.PermissionAsker,
 			PermissionContext: permission.Context{
 				Mode:               resolvePermissionMode(cfg.Permission.Mode),
 				AllowRules:         append([]permission.Rule(nil), cfg.Permission.Allow...),
