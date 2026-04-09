@@ -571,6 +571,35 @@ func TestSessionRunsFilteringAndPagination(t *testing.T) {
 		t.Fatalf("unexpected paged runs: %#v", resp.Runs)
 	}
 
+	req = httptest.NewRequest(http.MethodGet, "/session/sess-runs-filter/runs", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("default runs code = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode default runs response: %v", err)
+	}
+	if resp.Limit != maxRunHistory {
+		t.Fatalf("default limit = %d, want %d", resp.Limit, maxRunHistory)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/session/sess-runs-filter/runs?status=completed&limit=1&offset=100", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("high offset runs code = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode high offset runs response: %v", err)
+	}
+	if resp.Count != 0 {
+		t.Fatalf("high offset count = %d, want 0", resp.Count)
+	}
+	if !strings.Contains(rr.Body.String(), `"runs":[]`) {
+		t.Fatalf("expected empty runs array in response, got: %s", rr.Body.String())
+	}
+
 	req = httptest.NewRequest(http.MethodGet, "/session/sess-runs-filter/runs?status=running", nil)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -589,6 +618,33 @@ func TestSessionRunsFilteringAndPagination(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("invalid limit status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/session/sess-runs-filter/runs?status=oops", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid status code = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/session/sess-runs-filter/runs?offset=-1", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid offset code = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/session/sess-runs-filter/runs?limit=500", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("limit clamp code = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode clamped runs response: %v", err)
+	}
+	if resp.Limit != 200 {
+		t.Fatalf("clamped limit = %d, want 200", resp.Limit)
 	}
 }
 

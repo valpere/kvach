@@ -1034,7 +1034,7 @@ func (s *Server) listRuns(sessionID string) (*runInfo, []runInfo) {
 }
 
 func parseRunsQuery(r *http.Request) (runsQuery, error) {
-	q := runsQuery{Limit: 20, Offset: 0}
+	q := runsQuery{Limit: maxRunHistory, Offset: 0}
 
 	status := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("status")))
 	if status != "" {
@@ -1070,7 +1070,7 @@ func parseRunsQuery(r *http.Request) (runsQuery, error) {
 
 func filterRunsByStatus(runs []runInfo, status string) []runInfo {
 	if status == "" {
-		return append([]runInfo(nil), runs...)
+		return runs
 	}
 	out := make([]runInfo, 0, len(runs))
 	for _, run := range runs {
@@ -1082,11 +1082,11 @@ func filterRunsByStatus(runs []runInfo, status string) []runInfo {
 }
 
 func paginateRuns(runs []runInfo, offset, limit int) []runInfo {
-	if offset >= len(runs) {
-		return nil
-	}
 	if offset < 0 {
 		offset = 0
+	}
+	if offset >= len(runs) {
+		return []runInfo{}
 	}
 	if limit <= 0 {
 		limit = len(runs)
