@@ -49,8 +49,9 @@ type Server struct {
 	nextID uint64
 	subs   map[string]map[uint64]chan streamedEvent
 
-	runMu sync.RWMutex
-	runs  map[string]activePromptRun
+	runMu   sync.RWMutex
+	runs    map[string]activePromptRun
+	history map[string][]runInfo
 }
 
 // Options configures server dependencies.
@@ -89,6 +90,30 @@ type activePromptRun struct {
 	SessionID string
 }
 
+type runStatus string
+
+const (
+	runStatusRunning   runStatus = "running"
+	runStatusCompleted runStatus = "completed"
+	runStatusFailed    runStatus = "failed"
+	runStatusCancelled runStatus = "cancelled"
+	maxRunHistory                = 100
+)
+
+type runInfo struct {
+	RunID         string          `json:"run_id"`
+	SessionID     string          `json:"session_id"`
+	Status        runStatus       `json:"status"`
+	Model         string          `json:"model"`
+	Prompt        string          `json:"prompt"`
+	OutputPreview string          `json:"output_preview,omitempty"`
+	StartedAt     time.Time       `json:"started_at"`
+	FinishedAt    *time.Time      `json:"finished_at,omitempty"`
+	FinishReason  string          `json:"finish_reason,omitempty"`
+	Error         string          `json:"error,omitempty"`
+	Usage         agent.UsageInfo `json:"usage"`
+}
+
 // New creates a Server with the given configuration.
 func New(cfg config.ServerConfig, opts Options) *Server {
 	factory := opts.AgentFactory
@@ -103,6 +128,7 @@ func New(cfg config.ServerConfig, opts Options) *Server {
 		newAgent: factory,
 		subs:     make(map[string]map[uint64]chan streamedEvent),
 		runs:     make(map[string]activePromptRun),
+		history:  make(map[string][]runInfo),
 	}
 	s.router = s.buildRouter()
 	return s
@@ -147,6 +173,7 @@ func (s *Server) buildRouter() http.Handler {
 	mux.HandleFunc("POST /session", s.handleSessionCreate)
 	mux.HandleFunc("GET /session/{id}", s.handleSessionGet)
 	mux.HandleFunc("DELETE /session/{id}", s.handleSessionArchive)
+	mux.HandleFunc("GET /session/{id}/runs", s.handleSessionRuns)
 	mux.HandleFunc("GET /session/{id}/messages", s.handleSessionMessages)
 	mux.HandleFunc("POST /session/{id}/prompt", s.handleSessionPrompt)
 	mux.HandleFunc("POST /session/{id}/cancel", s.handleSessionCancel)
@@ -373,6 +400,34 @@ func (s *Server) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sess)
 }
 
+type runsResponse struct {
+	SessionID string    `json:"session_id"`
+	Active    *runInfo  `json:"active,omitempty"`
+	Runs      []runInfo `json:"runs"`
+}
+
+func (s *Server) handleSessionRuns(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		http.Error(w, "session id is required", http.StatusBadRequest)
+		return
+	}
+
+	if s.sessions != nil {
+		if _, err := s.sessions.GetSession(r.Context(), id); err != nil {
+			if err == session.ErrNotFound {
+				http.Error(w, "session not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, fmt.Sprintf("get session: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	active, runs := s.listRuns(id)
+	writeJSON(w, http.StatusOK, runsResponse{SessionID: id, Active: active, Runs: runs})
+}
+
 func (s *Server) handleSessionArchive(w http.ResponseWriter, r *http.Request) {
 	if s.sessions == nil {
 		http.Error(w, "session store unavailable", http.StatusServiceUnavailable)
@@ -541,12 +596,13 @@ func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	runID := uuid.NewString()
+	startedAt := time.Now().UTC()
 	runCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	s.registerRun(id, activePromptRun{
 		RunID:     runID,
 		Cancel:    cancel,
-		Started:   time.Now().UTC(),
+		Started:   startedAt,
 		Model:     cfg.Model,
 		Prompt:    req.Prompt,
 		SessionID: id,
@@ -556,6 +612,17 @@ func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 	events, err := runner.Run(runCtx, agent.RunOptions{Prompt: req.Prompt, SessionID: id})
 	if err != nil {
 		cancel()
+		finishedAt := time.Now().UTC()
+		s.appendRunHistory(id, runInfo{
+			RunID:      runID,
+			SessionID:  id,
+			Status:     runStatusFailed,
+			Model:      cfg.Model,
+			Prompt:     req.Prompt,
+			StartedAt:  startedAt,
+			FinishedAt: &finishedAt,
+			Error:      err.Error(),
+		})
 		http.Error(w, fmt.Sprintf("run agent: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -611,6 +678,28 @@ func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	status := runStatusCompleted
+	if finishReason == string(agent.ReasonAborted) {
+		status = runStatusCancelled
+	}
+	if agentErr != "" {
+		status = runStatusFailed
+	}
+	finishedAt := time.Now().UTC()
+	s.appendRunHistory(id, runInfo{
+		RunID:         runID,
+		SessionID:     id,
+		Status:        status,
+		Model:         cfg.Model,
+		Prompt:        req.Prompt,
+		OutputPreview: clamp(output.String(), 1000),
+		StartedAt:     startedAt,
+		FinishedAt:    &finishedAt,
+		FinishReason:  finishReason,
+		Error:         agentErr,
+		Usage:         usage,
+	})
 
 	resp := promptResponse{
 		RunID:        runID,
@@ -874,6 +963,41 @@ func (s *Server) cancelRun(sessionID string) (activePromptRun, bool) {
 	return run, true
 }
 
+func (s *Server) appendRunHistory(sessionID string, info runInfo) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+
+	s.runMu.Lock()
+	history := append([]runInfo{info}, s.history[sessionID]...)
+	if len(history) > maxRunHistory {
+		history = history[:maxRunHistory]
+	}
+	s.history[sessionID] = history
+	s.runMu.Unlock()
+}
+
+func (s *Server) listRuns(sessionID string) (*runInfo, []runInfo) {
+	s.runMu.RLock()
+	defer s.runMu.RUnlock()
+
+	var active *runInfo
+	if run, ok := s.runs[sessionID]; ok {
+		info := runInfo{
+			RunID:     run.RunID,
+			SessionID: run.SessionID,
+			Status:    runStatusRunning,
+			Model:     run.Model,
+			Prompt:    run.Prompt,
+			StartedAt: run.Started,
+		}
+		active = &info
+	}
+
+	history := append([]runInfo(nil), s.history[sessionID]...)
+	return active, history
+}
+
 func (s *Server) subscribeSession(sessionID string) (<-chan streamedEvent, func()) {
 	ch := make(chan streamedEvent, 128)
 
@@ -1010,4 +1134,14 @@ func splitModel(model string) (providerName, modelID string) {
 		return "google", model
 	}
 	return "anthropic", model
+}
+
+func clamp(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit]
 }

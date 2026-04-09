@@ -248,11 +248,34 @@ func TestSessionPromptAndEvents(t *testing.T) {
 	if resp.Output != "hello from fake" {
 		t.Fatalf("output = %q, want %q", resp.Output, "hello from fake")
 	}
+	if resp.RunID == "" {
+		t.Fatal("expected non-empty run id")
+	}
 	if resp.FinishReason != "completed" {
 		t.Fatalf("finishReason = %q, want %q", resp.FinishReason, "completed")
 	}
 	if resp.Usage.InputTokens != 11 || resp.Usage.OutputTokens != 7 {
 		t.Fatalf("unexpected usage: %#v", resp.Usage)
+	}
+
+	runsReq := httptest.NewRequest(http.MethodGet, "/session/sess-prompt/runs", nil)
+	runsRR := httptest.NewRecorder()
+	h.ServeHTTP(runsRR, runsReq)
+	if runsRR.Code != http.StatusOK {
+		t.Fatalf("runs status = %d, want %d: %s", runsRR.Code, http.StatusOK, runsRR.Body.String())
+	}
+	var runs runsResponse
+	if err := json.Unmarshal(runsRR.Body.Bytes(), &runs); err != nil {
+		t.Fatalf("decode runs response: %v", err)
+	}
+	if runs.Active != nil {
+		t.Fatalf("expected no active run, got %#v", runs.Active)
+	}
+	if len(runs.Runs) == 0 {
+		t.Fatal("expected run history entries")
+	}
+	if runs.Runs[0].RunID != resp.RunID || runs.Runs[0].Status != runStatusCompleted {
+		t.Fatalf("unexpected latest run entry: %#v", runs.Runs[0])
 	}
 
 	cancelEvents()
@@ -393,6 +416,20 @@ func TestSessionCancelEndpoint(t *testing.T) {
 
 	time.Sleep(30 * time.Millisecond)
 
+	runsReq := httptest.NewRequest(http.MethodGet, "/session/sess-cancel/runs", nil)
+	runsRR := httptest.NewRecorder()
+	h.ServeHTTP(runsRR, runsReq)
+	if runsRR.Code != http.StatusOK {
+		t.Fatalf("runs status = %d, want %d: %s", runsRR.Code, http.StatusOK, runsRR.Body.String())
+	}
+	var activeRuns runsResponse
+	if err := json.Unmarshal(runsRR.Body.Bytes(), &activeRuns); err != nil {
+		t.Fatalf("decode runs response: %v", err)
+	}
+	if activeRuns.Active == nil || activeRuns.Active.Status != runStatusRunning {
+		t.Fatalf("expected running active run, got %#v", activeRuns.Active)
+	}
+
 	cancelReq := httptest.NewRequest(http.MethodPost, "/session/sess-cancel/cancel", nil)
 	cancelRR := httptest.NewRecorder()
 	h.ServeHTTP(cancelRR, cancelReq)
@@ -415,6 +452,29 @@ func TestSessionCancelEndpoint(t *testing.T) {
 	}
 	if resp.FinishReason != string(agent.ReasonAborted) {
 		t.Fatalf("finishReason = %q, want %q", resp.FinishReason, string(agent.ReasonAborted))
+	}
+	if resp.RunID == "" {
+		t.Fatal("expected run id in prompt response")
+	}
+
+	runsReq = httptest.NewRequest(http.MethodGet, "/session/sess-cancel/runs", nil)
+	runsRR = httptest.NewRecorder()
+	h.ServeHTTP(runsRR, runsReq)
+	if runsRR.Code != http.StatusOK {
+		t.Fatalf("runs status = %d, want %d: %s", runsRR.Code, http.StatusOK, runsRR.Body.String())
+	}
+	var cancelledRuns runsResponse
+	if err := json.Unmarshal(runsRR.Body.Bytes(), &cancelledRuns); err != nil {
+		t.Fatalf("decode cancelled runs response: %v", err)
+	}
+	if cancelledRuns.Active != nil {
+		t.Fatalf("expected no active run after cancellation, got %#v", cancelledRuns.Active)
+	}
+	if len(cancelledRuns.Runs) == 0 {
+		t.Fatal("expected cancelled run in history")
+	}
+	if cancelledRuns.Runs[0].RunID != resp.RunID || cancelledRuns.Runs[0].Status != runStatusCancelled {
+		t.Fatalf("unexpected cancelled run entry: %#v", cancelledRuns.Runs[0])
 	}
 
 	cancelReq = httptest.NewRequest(http.MethodPost, "/session/sess-cancel/cancel", nil)
