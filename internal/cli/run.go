@@ -28,7 +28,9 @@ The agent runs the full agentic loop (including tool calls) and exits when compl
 			ctx := cmd.Context()
 			out := cmd.OutOrStdout()
 
-			runtime, err := newAgentRuntime(ctx)
+			runtime, err := newAgentRuntimeWithOptions(ctx, runtimeOptions{
+				PermissionAsker: newStdioPermissionAsker(cmd.InOrStdin(), cmd.OutOrStdout()),
+			})
 			if err != nil {
 				return err
 			}
@@ -72,6 +74,18 @@ The agent runs the full agentic loop (including tool calls) and exits when compl
 				case agent.EventToolError:
 					if info, ok := evt.Payload.(agent.ToolErrorInfo); ok {
 						fmt.Fprintf(out, "\n[error] %s: %s\n", info.Name, info.Message)
+					}
+				case agent.EventPermissionAsked:
+					if info, ok := evt.Payload.(agent.PermissionInfo); ok {
+						if globalFlags.Debug {
+							fmt.Fprintf(out, "\n[permission] asking for %s (%s)\n", info.ToolName, info.Risk)
+						}
+					}
+				case agent.EventPermissionResolved:
+					if info, ok := evt.Payload.(agent.PermissionResolutionInfo); ok {
+						if globalFlags.Debug {
+							fmt.Fprintf(out, "[permission] %s\n", info.Decision)
+						}
 					}
 				case agent.EventError:
 					if s, ok := evt.Payload.(string); ok {

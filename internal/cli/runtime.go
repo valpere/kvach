@@ -25,7 +25,15 @@ type agentRuntime struct {
 	projectID string
 }
 
+type runtimeOptions struct {
+	PermissionAsker permission.Asker
+}
+
 func newAgentRuntime(ctx context.Context) (*agentRuntime, error) {
+	return newAgentRuntimeWithOptions(ctx, runtimeOptions{})
+}
+
+func newAgentRuntimeWithOptions(ctx context.Context, opts runtimeOptions) (*agentRuntime, error) {
 	workDir := globalFlags.WorkDir
 	if workDir == "" {
 		workDir, _ = os.Getwd()
@@ -66,10 +74,11 @@ func newAgentRuntime(ctx context.Context) (*agentRuntime, error) {
 	}
 
 	a := agent.New(prov, tool.DefaultRegistry, store, agent.Config{
-		MaxTurns:     cfg.MaxTurns,
-		WorkDir:      workDir,
-		SystemPrompt: systemPrompt,
-		Model:        modelID,
+		MaxTurns:        cfg.MaxTurns,
+		WorkDir:         workDir,
+		SystemPrompt:    systemPrompt,
+		Model:           modelID,
+		PermissionAsker: opts.PermissionAsker,
 		PermissionContext: permission.Context{
 			Mode:               resolvePermissionMode(cfg.Permission.Mode),
 			AllowRules:         append([]permission.Rule(nil), cfg.Permission.Allow...),
