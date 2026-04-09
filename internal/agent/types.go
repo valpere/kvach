@@ -41,6 +41,7 @@ type Event struct {
 	//   EventToolError        -> ToolErrorInfo
 	//   EventUsageUpdated     -> UsageInfo
 	//   EventPermissionAsked  -> PermissionInfo
+	//   EventPermissionResolved -> PermissionResolutionInfo
 	//   EventError            -> string (error message)
 	Payload any
 }
@@ -81,6 +82,13 @@ type PermissionInfo struct {
 	ToolName    string
 	Description string
 	Risk        string // "low", "medium", "high", "destructive"
+}
+
+// PermissionResolutionInfo is the payload for EventPermissionResolved.
+type PermissionResolutionInfo struct {
+	ID       string
+	Decision string // "allow", "allow_always", "deny"
+	Reason   string
 }
 
 // TerminationReason describes why the agentic loop stopped.
