@@ -266,6 +266,81 @@ func TestSessionPromptAndEvents(t *testing.T) {
 	}
 }
 
+func TestProviderEndpoints(t *testing.T) {
+	s := New(config.ServerConfig{}, Options{})
+	h := s.buildRouter()
+
+	req := httptest.NewRequest(http.MethodGet, "/provider", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("provider list status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if !strings.Contains(rr.Body.String(), "anthropic") || !strings.Contains(rr.Body.String(), "openai") {
+		t.Fatalf("provider list missing expected providers: %s", rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/provider/openai/models", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("provider models status = %d, want %d: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "gpt-4o") {
+		t.Fatalf("provider models missing expected model: %s", rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/provider/unknown/models", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("unknown provider status = %d, want %d", rr.Code, http.StatusNotFound)
+	}
+}
+
+func TestSessionPromptStreamingMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStoreForTest(t)
+	workDir := t.TempDir()
+	now := time.Now().UTC()
+
+	if err := store.CreateSession(ctx, session.Session{
+		ID:        "sess-stream",
+		ProjectID: git.SlugFromRoot(workDir),
+		Directory: workDir,
+		Title:     "stream",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	factory := func(_ context.Context, _ AgentFactoryArgs) (AgentRunner, error) {
+		return fakeRunner{events: []agent.Event{
+			{Type: agent.EventTextDelta, Payload: "streamed chunk"},
+			{Type: agent.EventDone, Payload: "completed"},
+		}}, nil
+	}
+
+	s := New(config.ServerConfig{}, Options{WorkDir: workDir, SessionStore: store, AgentFactory: factory})
+	h := s.buildRouter()
+
+	req := httptest.NewRequest(http.MethodPost, "/session/sess-stream/prompt?stream=true", bytes.NewBufferString(`{"prompt":"hi"}`))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("stream prompt status = %d, want %d: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "event: text.delta") {
+		t.Fatalf("expected text.delta event in stream, got: %s", body)
+	}
+	if !strings.Contains(body, "event: response.completed") {
+		t.Fatalf("expected response.completed event in stream, got: %s", body)
+	}
+}
+
 func TestSessionEvents(t *testing.T) {
 	s := New(config.ServerConfig{}, Options{})
 	h := s.buildRouter()
