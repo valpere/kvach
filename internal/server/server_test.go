@@ -16,6 +16,7 @@ import (
 	"github.com/valpere/kvach/internal/agent"
 	"github.com/valpere/kvach/internal/config"
 	"github.com/valpere/kvach/internal/git"
+	"github.com/valpere/kvach/internal/permission"
 	"github.com/valpere/kvach/internal/session"
 )
 
@@ -667,6 +668,114 @@ func TestSessionEvents(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "event: session.ready") {
 		t.Fatalf("events body missing ready event: %s", rr.Body.String())
+	}
+}
+
+func TestPermissionResolveEndpoint(t *testing.T) {
+	ctx := context.Background()
+	store := openStoreForTest(t)
+	workDir := t.TempDir()
+	now := time.Now().UTC()
+
+	if err := store.CreateSession(ctx, session.Session{
+		ID:        "sess-perm",
+		ProjectID: git.SlugFromRoot(workDir),
+		Directory: workDir,
+		Title:     "permission",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	s := New(config.ServerConfig{}, Options{WorkDir: workDir, SessionStore: store})
+	asker := s.newPermissionAsker("sess-perm")
+
+	replyCh := make(chan permission.Reply, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		reply, err := asker.Ask(context.Background(), permission.Request{
+			ID:          "perm-1",
+			ToolName:    "Bash",
+			Description: "run command",
+			Risk:        "high",
+		})
+		if err != nil {
+			errCh <- err
+			return
+		}
+		replyCh <- reply
+	}()
+
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		s.permMu.RLock()
+		_, ok := s.pendingPermission["sess-perm"]["perm-1"]
+		s.permMu.RUnlock()
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("permission request was not registered in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	h := s.buildRouter()
+	req := httptest.NewRequest(http.MethodPost, "/session/sess-perm/permission/perm-1/resolve", bytes.NewBufferString(`{"decision":"allow_always","pattern":"git:*"}`))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("resolve status = %d, want %d: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("ask returned error: %v", err)
+	case reply := <-replyCh:
+		if reply.Decision != "allow_always" {
+			t.Fatalf("reply decision = %q, want allow_always", reply.Decision)
+		}
+		if reply.Pattern != "git:*" {
+			t.Fatalf("reply pattern = %q, want git:*", reply.Pattern)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for permission reply")
+	}
+}
+
+func TestPermissionResolveEndpointValidation(t *testing.T) {
+	ctx := context.Background()
+	store := openStoreForTest(t)
+	workDir := t.TempDir()
+	now := time.Now().UTC()
+
+	if err := store.CreateSession(ctx, session.Session{
+		ID:        "sess-perm-2",
+		ProjectID: git.SlugFromRoot(workDir),
+		Directory: workDir,
+		Title:     "permission-2",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	s := New(config.ServerConfig{}, Options{WorkDir: workDir, SessionStore: store})
+	h := s.buildRouter()
+
+	req := httptest.NewRequest(http.MethodPost, "/session/sess-perm-2/permission/perm-missing/resolve", bytes.NewBufferString(`{"decision":"allow_once"}`))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("missing request status = %d, want %d", rr.Code, http.StatusNotFound)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/session/sess-perm-2/permission/perm-x/resolve", bytes.NewBufferString(`{"decision":"invalid"}`))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid decision status = %d, want %d", rr.Code, http.StatusBadRequest)
 	}
 }
 
