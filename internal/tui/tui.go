@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/valpere/kvach/internal/agent"
+	"github.com/valpere/kvach/internal/permission"
 )
 
 // Config configures a TUI run.
@@ -21,6 +22,8 @@ type Config struct {
 	Model string
 	In    io.Reader
 	Out   io.Writer
+
+	PermissionAsker *PermissionAsker
 }
 
 // Run starts the interactive Bubble Tea UI.
@@ -32,7 +35,7 @@ func Run(ctx context.Context, cfg Config) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	m := newModel(runCtx, cancel, cfg.Agent, cfg.Model)
+	m := newModel(runCtx, cancel, cfg.Agent, cfg.Model, cfg.PermissionAsker)
 	opts := []tea.ProgramOption{tea.WithContext(runCtx)}
 	if cfg.In != nil {
 		opts = append(opts, tea.WithInput(cfg.In))
@@ -60,6 +63,9 @@ type model struct {
 	activeTool   string
 	usage        agent.UsageInfo
 
+	permissionAsker *PermissionAsker
+	pendingPrompt   *permissionPrompt
+
 	running bool
 	width   int
 	height  int
@@ -76,7 +82,11 @@ type agentEventMsg struct {
 	ok     bool
 }
 
-func newModel(ctx context.Context, cancel context.CancelFunc, a *agent.Agent, modelName string) model {
+type permissionPromptMsg struct {
+	prompt permissionPrompt
+}
+
+func newModel(ctx context.Context, cancel context.CancelFunc, a *agent.Agent, modelName string, asker *PermissionAsker) model {
 	vp := viewport.New(0, 0)
 	input := textarea.New()
 	input.Placeholder = "Ask kvach to inspect or change your code..."
@@ -87,20 +97,21 @@ func newModel(ctx context.Context, cancel context.CancelFunc, a *agent.Agent, mo
 	input.ShowLineNumbers = false
 
 	m := model{
-		ctx:       ctx,
-		cancel:    cancel,
-		agent:     a,
-		modelName: modelName,
-		viewport:  vp,
-		input:     input,
-		status:    "idle",
+		ctx:             ctx,
+		cancel:          cancel,
+		agent:           a,
+		modelName:       modelName,
+		viewport:        vp,
+		input:           input,
+		status:          "idle",
+		permissionAsker: asker,
 	}
 	m.appendConversation("Welcome to kvach. Press Ctrl+S to send, Enter for a new line, Ctrl+C to quit.\n")
 	return m
 }
 
 func (m model) Init() tea.Cmd {
-	return textarea.Blink
+	return tea.Batch(textarea.Blink, waitPermissionPromptCmd(m.permissionAsker))
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -112,6 +123,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.pendingPrompt != nil {
+			switch strings.ToLower(strings.TrimSpace(msg.String())) {
+			case "y":
+				m.resolvePermissionPrompt("allow_once")
+				return m, nil
+			case "a":
+				m.resolvePermissionPrompt("allow_always")
+				return m, nil
+			case "n", "esc":
+				m.resolvePermissionPrompt("deny")
+				return m, nil
+			case "ctrl+c":
+				m.resolvePermissionPrompt("deny")
+				m.cancel()
+				return m, tea.Quit
+			default:
+				return m, nil
+			}
+		}
+
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			m.cancel()
@@ -135,6 +166,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+	case permissionPromptMsg:
+		m.pendingPrompt = &msg.prompt
+		m.status = "permission"
+		m.appendConversation(fmt.Sprintf("\n[permission] %s\n%s\nPress y=allow once, a=allow always, n=deny\n", msg.prompt.Request.ToolName, msg.prompt.Request.Description))
+		return m, waitPermissionPromptCmd(m.permissionAsker)
+
 	case runStartedMsg:
 		if msg.err != nil {
 			m.running = false
@@ -179,6 +216,9 @@ func (m model) View() string {
 
 	statusLine := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(status)
 	help := lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("Ctrl+S send  Enter newline  PgUp/PgDn scroll  Ctrl+C quit")
+	if m.pendingPrompt != nil {
+		help = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("Permission pending: y allow once  a allow always  n deny")
+	}
 
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
@@ -220,6 +260,14 @@ func (m *model) handleAgentEvent(evt agent.Event) {
 		if s, ok := evt.Payload.(string); ok {
 			m.appendConversation(fmt.Sprintf("\n[error] %s\n", s))
 		}
+	case agent.EventPermissionAsked:
+		if info, ok := evt.Payload.(agent.PermissionInfo); ok {
+			m.appendConversation(fmt.Sprintf("\n[permission asked] %s (%s)\n", info.ToolName, info.Risk))
+		}
+	case agent.EventPermissionResolved:
+		if info, ok := evt.Payload.(agent.PermissionResolutionInfo); ok {
+			m.appendConversation(fmt.Sprintf("[permission] %s\n", info.Decision))
+		}
 	case agent.EventDone:
 		m.running = false
 		m.activeTool = ""
@@ -230,6 +278,24 @@ func (m *model) handleAgentEvent(evt agent.Event) {
 		}
 		m.appendConversation("\n")
 	}
+}
+
+func (m *model) resolvePermissionPrompt(decision string) {
+	if m.pendingPrompt == nil {
+		return
+	}
+	req := m.pendingPrompt.Request
+	reply := permission.Reply{Decision: decision, ToolName: req.ToolName, Pattern: "*"}
+	select {
+	case m.pendingPrompt.Response <- reply:
+	default:
+	}
+	if m.running {
+		m.status = "running"
+	} else {
+		m.status = "idle"
+	}
+	m.pendingPrompt = nil
 }
 
 func (m *model) appendConversation(s string) {
@@ -273,5 +339,18 @@ func waitAgentEventCmd(events <-chan agent.Event) tea.Cmd {
 	return func() tea.Msg {
 		evt, ok := <-events
 		return agentEventMsg{events: events, event: evt, ok: ok}
+	}
+}
+
+func waitPermissionPromptCmd(asker *PermissionAsker) tea.Cmd {
+	if asker == nil || asker.Requests() == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		prompt, ok := <-asker.Requests()
+		if !ok {
+			return nil
+		}
+		return permissionPromptMsg{prompt: prompt}
 	}
 }
