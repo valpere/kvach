@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -100,6 +101,7 @@ type activePromptRun struct {
 type pendingPermission struct {
 	Request permission.Request
 	Reply   chan permission.Reply
+	Created time.Time
 }
 
 type runStatus string
@@ -190,6 +192,7 @@ func (s *Server) buildRouter() http.Handler {
 	mux.HandleFunc("GET /session/{id}/messages", s.handleSessionMessages)
 	mux.HandleFunc("POST /session/{id}/prompt", s.handleSessionPrompt)
 	mux.HandleFunc("POST /session/{id}/cancel", s.handleSessionCancel)
+	mux.HandleFunc("GET /session/{id}/permission/pending", s.handlePermissionPending)
 	mux.HandleFunc("POST /session/{id}/permission/{requestID}/resolve", s.handlePermissionResolve)
 	mux.HandleFunc("GET /session/{id}/events", s.handleSessionEvents)
 	return mux
@@ -596,6 +599,22 @@ type resolvePermissionResponse struct {
 	Resolved  bool   `json:"resolved"`
 }
 
+type pendingPermissionItem struct {
+	RequestID   string         `json:"request_id"`
+	ToolName    string         `json:"tool_name"`
+	Description string         `json:"description"`
+	Risk        string         `json:"risk"`
+	Pattern     string         `json:"pattern,omitempty"`
+	Input       map[string]any `json:"input,omitempty"`
+	CreatedAt   time.Time      `json:"created_at"`
+}
+
+type pendingPermissionsResponse struct {
+	SessionID string                  `json:"session_id"`
+	Count     int                     `json:"count"`
+	Items     []pendingPermissionItem `json:"items"`
+}
+
 func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 	if s.sessions == nil {
 		http.Error(w, "session store unavailable", http.StatusServiceUnavailable)
@@ -811,6 +830,32 @@ func (s *Server) handleSessionCancel(w http.ResponseWriter, r *http.Request) {
 		SessionID: id,
 		RunID:     run.RunID,
 		Cancelled: true,
+	})
+}
+
+func (s *Server) handlePermissionPending(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		http.Error(w, "session id is required", http.StatusBadRequest)
+		return
+	}
+
+	if s.sessions != nil {
+		if _, err := s.sessions.GetSession(r.Context(), id); err != nil {
+			if err == session.ErrNotFound {
+				http.Error(w, "session not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, fmt.Sprintf("get session: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	items := s.listPendingPermissions(id)
+	writeJSON(w, http.StatusOK, pendingPermissionsResponse{
+		SessionID: id,
+		Count:     len(items),
+		Items:     items,
 	})
 }
 
@@ -1162,7 +1207,7 @@ func (s *Server) registerPendingPermission(sessionID string, req permission.Requ
 	if _, exists := s.pendingPermission[sessionID][req.ID]; exists {
 		return false
 	}
-	s.pendingPermission[sessionID][req.ID] = pendingPermission{Request: req, Reply: resp}
+	s.pendingPermission[sessionID][req.ID] = pendingPermission{Request: req, Reply: resp, Created: time.Now().UTC()}
 	return true
 }
 
@@ -1201,6 +1246,38 @@ func (s *Server) resolvePendingPermission(sessionID, requestID string, reply per
 	default:
 		return false
 	}
+}
+
+func (s *Server) listPendingPermissions(sessionID string) []pendingPermissionItem {
+	s.permMu.RLock()
+	defer s.permMu.RUnlock()
+
+	pendingBySession, ok := s.pendingPermission[sessionID]
+	if !ok || len(pendingBySession) == 0 {
+		return []pendingPermissionItem{}
+	}
+
+	items := make([]pendingPermissionItem, 0, len(pendingBySession))
+	for _, p := range pendingBySession {
+		item := pendingPermissionItem{
+			RequestID:   p.Request.ID,
+			ToolName:    p.Request.ToolName,
+			Description: p.Request.Description,
+			Risk:        p.Request.Risk,
+			Pattern:     p.Request.Pattern,
+			Input:       p.Request.Input,
+			CreatedAt:   p.Created,
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].RequestID < items[j].RequestID
+		}
+		return items[i].CreatedAt.Before(items[j].CreatedAt)
+	})
+
+	return items
 }
 
 func parseRunsQuery(r *http.Request) (runsQuery, error) {

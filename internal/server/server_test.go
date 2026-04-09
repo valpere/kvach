@@ -779,6 +779,99 @@ func TestPermissionResolveEndpointValidation(t *testing.T) {
 	}
 }
 
+func TestPermissionPendingEndpoint(t *testing.T) {
+	ctx := context.Background()
+	store := openStoreForTest(t)
+	workDir := t.TempDir()
+	now := time.Now().UTC()
+
+	if err := store.CreateSession(ctx, session.Session{
+		ID:        "sess-perm-pending",
+		ProjectID: git.SlugFromRoot(workDir),
+		Directory: workDir,
+		Title:     "permission-pending",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	s := New(config.ServerConfig{}, Options{WorkDir: workDir, SessionStore: store})
+	asker := s.newPermissionAsker("sess-perm-pending")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = asker.Ask(context.Background(), permission.Request{
+			ID:          "perm-p1",
+			ToolName:    "Write",
+			Description: "write a file",
+			Risk:        "medium",
+			Pattern:     "src/**",
+			Input:       map[string]any{"path": "src/main.go"},
+		})
+	}()
+
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		s.permMu.RLock()
+		_, ok := s.pendingPermission["sess-perm-pending"]["perm-p1"]
+		s.permMu.RUnlock()
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pending permission request not registered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	h := s.buildRouter()
+	req := httptest.NewRequest(http.MethodGet, "/session/sess-perm-pending/permission/pending", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("pending status = %d, want %d: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var resp pendingPermissionsResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode pending response: %v", err)
+	}
+	if resp.Count != 1 || len(resp.Items) != 1 {
+		t.Fatalf("expected one pending item, got count=%d items=%d", resp.Count, len(resp.Items))
+	}
+	if resp.Items[0].RequestID != "perm-p1" || resp.Items[0].ToolName != "Write" {
+		t.Fatalf("unexpected pending item: %#v", resp.Items[0])
+	}
+
+	resolveReq := httptest.NewRequest(http.MethodPost, "/session/sess-perm-pending/permission/perm-p1/resolve", bytes.NewBufferString(`{"decision":"deny"}`))
+	resolveRR := httptest.NewRecorder()
+	h.ServeHTTP(resolveRR, resolveReq)
+	if resolveRR.Code != http.StatusOK {
+		t.Fatalf("resolve status = %d, want %d: %s", resolveRR.Code, http.StatusOK, resolveRR.Body.String())
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ask call did not finish after resolve")
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/session/sess-perm-pending/permission/pending", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("pending-after-resolve status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode pending-after-resolve response: %v", err)
+	}
+	if resp.Count != 0 || len(resp.Items) != 0 {
+		t.Fatalf("expected no pending items after resolve, got count=%d items=%d", resp.Count, len(resp.Items))
+	}
+}
+
 func openStoreForTest(t *testing.T) *session.SQLiteStore {
 	t.Helper()
 	ctx := context.Background()
