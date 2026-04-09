@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -402,8 +403,19 @@ func (s *Server) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 
 type runsResponse struct {
 	SessionID string    `json:"session_id"`
+	Status    string    `json:"status,omitempty"`
+	Limit     int       `json:"limit"`
+	Offset    int       `json:"offset"`
+	Total     int       `json:"total"`
+	Count     int       `json:"count"`
 	Active    *runInfo  `json:"active,omitempty"`
 	Runs      []runInfo `json:"runs"`
+}
+
+type runsQuery struct {
+	Status string
+	Limit  int
+	Offset int
 }
 
 func (s *Server) handleSessionRuns(w http.ResponseWriter, r *http.Request) {
@@ -424,8 +436,31 @@ func (s *Server) handleSessionRuns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	q, err := parseRunsQuery(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	active, runs := s.listRuns(id)
-	writeJSON(w, http.StatusOK, runsResponse{SessionID: id, Active: active, Runs: runs})
+	if q.Status != "" && (active == nil || string(active.Status) != q.Status) {
+		active = nil
+	}
+
+	filtered := filterRunsByStatus(runs, q.Status)
+	total := len(filtered)
+	paged := paginateRuns(filtered, q.Offset, q.Limit)
+
+	writeJSON(w, http.StatusOK, runsResponse{
+		SessionID: id,
+		Status:    q.Status,
+		Limit:     q.Limit,
+		Offset:    q.Offset,
+		Total:     total,
+		Count:     len(paged),
+		Active:    active,
+		Runs:      paged,
+	})
 }
 
 func (s *Server) handleSessionArchive(w http.ResponseWriter, r *http.Request) {
@@ -996,6 +1031,71 @@ func (s *Server) listRuns(sessionID string) (*runInfo, []runInfo) {
 
 	history := append([]runInfo(nil), s.history[sessionID]...)
 	return active, history
+}
+
+func parseRunsQuery(r *http.Request) (runsQuery, error) {
+	q := runsQuery{Limit: 20, Offset: 0}
+
+	status := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("status")))
+	if status != "" {
+		switch runStatus(status) {
+		case runStatusRunning, runStatusCompleted, runStatusFailed, runStatusCancelled:
+			q.Status = status
+		default:
+			return runsQuery{}, fmt.Errorf("invalid status %q", status)
+		}
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			return runsQuery{}, fmt.Errorf("invalid limit %q", raw)
+		}
+		if n > 200 {
+			n = 200
+		}
+		q.Limit = n
+	}
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("offset")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return runsQuery{}, fmt.Errorf("invalid offset %q", raw)
+		}
+		q.Offset = n
+	}
+
+	return q, nil
+}
+
+func filterRunsByStatus(runs []runInfo, status string) []runInfo {
+	if status == "" {
+		return append([]runInfo(nil), runs...)
+	}
+	out := make([]runInfo, 0, len(runs))
+	for _, run := range runs {
+		if string(run.Status) == status {
+			out = append(out, run)
+		}
+	}
+	return out
+}
+
+func paginateRuns(runs []runInfo, offset, limit int) []runInfo {
+	if offset >= len(runs) {
+		return nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = len(runs)
+	}
+	end := offset + limit
+	if end > len(runs) {
+		end = len(runs)
+	}
+	return append([]runInfo(nil), runs[offset:end]...)
 }
 
 func (s *Server) subscribeSession(sessionID string) (<-chan streamedEvent, func()) {

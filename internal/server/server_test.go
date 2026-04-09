@@ -485,6 +485,113 @@ func TestSessionCancelEndpoint(t *testing.T) {
 	}
 }
 
+func TestSessionRunsFilteringAndPagination(t *testing.T) {
+	ctx := context.Background()
+	store := openStoreForTest(t)
+	workDir := t.TempDir()
+	now := time.Now().UTC()
+
+	if err := store.CreateSession(ctx, session.Session{
+		ID:        "sess-runs-filter",
+		ProjectID: git.SlugFromRoot(workDir),
+		Directory: workDir,
+		Title:     "runs-filter",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	s := New(config.ServerConfig{}, Options{WorkDir: workDir, SessionStore: store})
+	h := s.buildRouter()
+
+	finished := now.Add(1 * time.Minute)
+	s.appendRunHistory("sess-runs-filter", runInfo{
+		RunID:      "run-3",
+		SessionID:  "sess-runs-filter",
+		Status:     runStatusFailed,
+		Model:      "openai/gpt-4o",
+		Prompt:     "third",
+		StartedAt:  now,
+		FinishedAt: &finished,
+	})
+	s.appendRunHistory("sess-runs-filter", runInfo{
+		RunID:      "run-2",
+		SessionID:  "sess-runs-filter",
+		Status:     runStatusCompleted,
+		Model:      "openai/gpt-4o",
+		Prompt:     "second",
+		StartedAt:  now,
+		FinishedAt: &finished,
+	})
+	s.appendRunHistory("sess-runs-filter", runInfo{
+		RunID:      "run-1",
+		SessionID:  "sess-runs-filter",
+		Status:     runStatusCompleted,
+		Model:      "openai/gpt-4o",
+		Prompt:     "first",
+		StartedAt:  now,
+		FinishedAt: &finished,
+	})
+
+	s.registerRun("sess-runs-filter", activePromptRun{
+		RunID:     "run-active",
+		SessionID: "sess-runs-filter",
+		Prompt:    "active",
+		Model:     "openai/gpt-4o",
+		Started:   now,
+		Cancel:    func() {},
+	})
+	defer s.clearRun("sess-runs-filter", "run-active")
+
+	req := httptest.NewRequest(http.MethodGet, "/session/sess-runs-filter/runs?status=completed&limit=1&offset=1", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("runs status = %d, want %d: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var resp runsResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode runs response: %v", err)
+	}
+	if resp.Status != "completed" {
+		t.Fatalf("status filter = %q, want %q", resp.Status, "completed")
+	}
+	if resp.Limit != 1 || resp.Offset != 1 {
+		t.Fatalf("unexpected pagination fields: limit=%d offset=%d", resp.Limit, resp.Offset)
+	}
+	if resp.Total != 2 || resp.Count != 1 {
+		t.Fatalf("unexpected total/count: total=%d count=%d", resp.Total, resp.Count)
+	}
+	if resp.Active != nil {
+		t.Fatalf("expected active run hidden by completed status filter, got %#v", resp.Active)
+	}
+	if len(resp.Runs) != 1 || resp.Runs[0].RunID != "run-2" {
+		t.Fatalf("unexpected paged runs: %#v", resp.Runs)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/session/sess-runs-filter/runs?status=running", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("running status runs code = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode running runs response: %v", err)
+	}
+	if resp.Active == nil || resp.Active.RunID != "run-active" {
+		t.Fatalf("expected active run in running filter, got %#v", resp.Active)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/session/sess-runs-filter/runs?limit=bad", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit status = %d, want %d", rr.Code, http.StatusBadRequest)
+	}
+}
+
 func TestSessionEvents(t *testing.T) {
 	s := New(config.ServerConfig{}, Options{})
 	h := s.buildRouter()
