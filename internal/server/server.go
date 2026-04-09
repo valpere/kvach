@@ -29,6 +29,7 @@ import (
 	"github.com/valpere/kvach/internal/agent"
 	"github.com/valpere/kvach/internal/config"
 	"github.com/valpere/kvach/internal/git"
+	"github.com/valpere/kvach/internal/permission"
 	"github.com/valpere/kvach/internal/provider"
 	anthropicProvider "github.com/valpere/kvach/internal/provider/anthropic"
 	googleProvider "github.com/valpere/kvach/internal/provider/google"
@@ -1214,6 +1215,12 @@ func defaultAgentFactory(store session.Store) AgentFactory {
 			WorkDir:      args.WorkDir,
 			SystemPrompt: systemPrompt,
 			Model:        modelID,
+			PermissionContext: permission.Context{
+				Mode:               resolvePermissionMode(cfg.Permission.Mode),
+				AllowRules:         append([]permission.Rule(nil), cfg.Permission.Allow...),
+				DenyRules:          append([]permission.Rule(nil), cfg.Permission.Deny...),
+				WorkingDirectories: []string{args.WorkDir},
+			},
 		})
 		return a, nil
 	}
@@ -1234,6 +1241,13 @@ func splitModel(model string) (providerName, modelID string) {
 		return "google", model
 	}
 	return "anthropic", model
+}
+
+func resolvePermissionMode(mode permission.Mode) permission.Mode {
+	if mode == "" {
+		return permission.ModeBypass
+	}
+	return mode
 }
 
 func clamp(s string, limit int) string {

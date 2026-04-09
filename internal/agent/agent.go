@@ -11,6 +11,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"github.com/valpere/kvach/internal/git"
 	"github.com/valpere/kvach/internal/memory"
 	"github.com/valpere/kvach/internal/multiagent"
+	"github.com/valpere/kvach/internal/permission"
 	"github.com/valpere/kvach/internal/provider"
 	"github.com/valpere/kvach/internal/session"
 	"github.com/valpere/kvach/internal/tool"
@@ -54,6 +56,13 @@ type Config struct {
 
 	// Model overrides the provider-level model selection.
 	Model string
+
+	// PermissionContext controls whether tool calls are allowed, denied, or
+	// require user confirmation.
+	PermissionContext permission.Context
+
+	// PermissionAsker is used when a tool call requires interactive approval.
+	PermissionAsker permission.Asker
 }
 
 // New creates an Agent with the given provider, tool registry, session store,
@@ -71,6 +80,12 @@ func New(p provider.Provider, r *tool.Registry, s session.Store, cfg Config) *Ag
 		sessions: s,
 		bus:      bus.New(),
 		config:   cfg,
+	}
+	if a.config.PermissionContext.Mode == "" {
+		a.config.PermissionContext.Mode = permission.ModeBypass
+	}
+	if strings.TrimSpace(a.config.WorkDir) != "" && len(a.config.PermissionContext.WorkingDirectories) == 0 {
+		a.config.PermissionContext.WorkingDirectories = []string{a.config.WorkDir}
 	}
 	a.tasks = newSubagentRunner(a)
 	return a
@@ -381,6 +396,8 @@ func (a *Agent) executeToolCalls(ctx context.Context, sessionID string, calls []
 	tctx := &tool.Context{
 		SessionID:    sessionID,
 		WorkDir:      a.config.WorkDir,
+		Permissions:  &a.config.PermissionContext,
+		Asker:        a.config.PermissionAsker,
 		TaskRunner:   a.tasks,
 		SessionStore: a.sessions,
 		EventBus:     a.bus,
@@ -424,6 +441,23 @@ func (a *Agent) executeToolCalls(ctx context.Context, sessionID string, calls []
 			continue
 		}
 
+		permissionInput := decodePermissionInput(input)
+
+		if err := a.checkToolPermissions(ctx, t, tc, permissionInput, input, tctx, events); err != nil {
+			parts = append(parts, provider.Part{
+				Type: provider.PartTypeToolResult,
+				ToolResult: &provider.ToolResultPart{
+					ToolUseID: tc.ID,
+					Content:   fmt.Sprintf("Permission denied: %v", err),
+					IsError:   true,
+				},
+			})
+			events <- Event{Type: EventToolError, Payload: ToolErrorInfo{
+				ID: tc.ID, Name: tc.Name, Message: err.Error(),
+			}}
+			continue
+		}
+
 		// Execute the tool.
 		result, err := t.Call(ctx, input, tctx)
 		if err != nil {
@@ -454,6 +488,160 @@ func (a *Agent) executeToolCalls(ctx context.Context, sessionID string, calls []
 	}
 
 	return parts
+}
+
+func decodePermissionInput(input json.RawMessage) map[string]any {
+	var decoded map[string]any
+	if err := json.Unmarshal(input, &decoded); err != nil || decoded == nil {
+		return map[string]any{}
+	}
+	return decoded
+}
+
+func (a *Agent) checkToolPermissions(
+	ctx context.Context,
+	t tool.Tool,
+	tc toolCall,
+	inputMap map[string]any,
+	rawInput json.RawMessage,
+	tctx *tool.Context,
+	events chan<- Event,
+) error {
+	toolDecision := t.CheckPermissions(rawInput, tctx)
+	if strings.EqualFold(toolDecision.Decision, "deny") {
+		reason := strings.TrimSpace(toolDecision.Reason)
+		if reason == "" {
+			reason = "blocked by tool-specific permission checks"
+		}
+		return errors.New(reason)
+	}
+	if strings.EqualFold(toolDecision.Decision, "ask") {
+		return a.askPermission(ctx, tc, inputMap, t, toolDecision.Reason, events)
+	}
+
+	pctx := &a.config.PermissionContext
+
+	for _, rule := range pctx.DenyRules {
+		if permission.MatchRule(rule, tc.Name, inputMap) {
+			return fmt.Errorf("blocked by deny rule (%s %s)", rule.Tool, rule.Pattern)
+		}
+	}
+
+	for _, rule := range pctx.AllowRules {
+		if permission.MatchRule(rule, tc.Name, inputMap) {
+			return nil
+		}
+	}
+
+	if t.IsDestructive(rawInput) {
+		return a.askPermission(ctx, tc, inputMap, t, "destructive tool call", events)
+	}
+
+	switch pctx.Mode {
+	case permission.ModeBypass:
+		return nil
+	case permission.ModePlan:
+		if !t.IsReadOnly(rawInput) {
+			return fmt.Errorf("mode %q allows read-only tools only", pctx.Mode)
+		}
+		return nil
+	case permission.ModeDontAsk:
+		if t.IsReadOnly(rawInput) {
+			return nil
+		}
+		return fmt.Errorf("mode %q requires explicit allow rules", pctx.Mode)
+	case permission.ModeAcceptEdits:
+		if t.IsReadOnly(rawInput) {
+			return nil
+		}
+		if strings.EqualFold(tc.Name, "Bash") {
+			return a.askPermission(ctx, tc, inputMap, t, "shell execution requires confirmation", events)
+		}
+		return nil
+	default:
+		if t.IsReadOnly(rawInput) {
+			return nil
+		}
+		return a.askPermission(ctx, tc, inputMap, t, "tool call requires confirmation", events)
+	}
+}
+
+func (a *Agent) askPermission(
+	ctx context.Context,
+	tc toolCall,
+	input map[string]any,
+	t tool.Tool,
+	reason string,
+	events chan<- Event,
+) error {
+	requestID := "perm-" + uuid.NewString()
+	risk := "medium"
+	if t.IsDestructive(json.RawMessage(tc.inputJSON.String())) {
+		risk = "destructive"
+	}
+	description := strings.TrimSpace(reason)
+	if description == "" {
+		description = "permission required"
+	}
+
+	events <- Event{Type: EventPermissionAsked, Payload: PermissionInfo{
+		ID:          requestID,
+		ToolName:    tc.Name,
+		Description: description,
+		Risk:        risk,
+	}}
+
+	asker := a.config.PermissionAsker
+	if asker == nil {
+		events <- Event{Type: EventPermissionResolved, Payload: PermissionResolutionInfo{
+			ID:       requestID,
+			Decision: "deny",
+			Reason:   "no permission asker configured",
+		}}
+		return fmt.Errorf("%s: no permission asker configured", description)
+	}
+
+	reply, err := asker.Ask(ctx, permission.Request{
+		ID:          requestID,
+		ToolName:    tc.Name,
+		Description: description,
+		Input:       input,
+		Risk:        risk,
+	})
+	if err != nil {
+		events <- Event{Type: EventPermissionResolved, Payload: PermissionResolutionInfo{
+			ID:       requestID,
+			Decision: "deny",
+			Reason:   err.Error(),
+		}}
+		return err
+	}
+
+	switch strings.ToLower(strings.TrimSpace(reply.Decision)) {
+	case "allow_once":
+		events <- Event{Type: EventPermissionResolved, Payload: PermissionResolutionInfo{ID: requestID, Decision: "allow"}}
+		return nil
+	case "allow_always":
+		pattern := strings.TrimSpace(reply.Pattern)
+		if pattern == "" {
+			pattern = "*"
+		}
+		a.config.PermissionContext.AllowRules = append(a.config.PermissionContext.AllowRules, permission.Rule{
+			Source:   permission.RuleSourceSession,
+			Behavior: "allow",
+			Tool:     tc.Name,
+			Pattern:  pattern,
+		})
+		events <- Event{Type: EventPermissionResolved, Payload: PermissionResolutionInfo{ID: requestID, Decision: "allow_always"}}
+		return nil
+	default:
+		events <- Event{Type: EventPermissionResolved, Payload: PermissionResolutionInfo{
+			ID:       requestID,
+			Decision: "deny",
+			Reason:   "denied by user",
+		}}
+		return fmt.Errorf("denied by user")
+	}
 }
 
 // buildToolSchemas converts the registry's tools into provider.ToolSchema
