@@ -127,6 +127,8 @@ func (s *Server) buildRouter() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /project", s.handleProject)
 	mux.HandleFunc("GET /config", s.handleConfig)
+	mux.HandleFunc("GET /provider", s.handleProviderList)
+	mux.HandleFunc("GET /provider/{id}/models", s.handleProviderModels)
 	mux.HandleFunc("GET /session", s.handleSessionList)
 	mux.HandleFunc("POST /session", s.handleSessionCreate)
 	mux.HandleFunc("GET /session/{id}", s.handleSessionGet)
@@ -173,6 +175,44 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 		"port":               s.cfg.Port,
 		"password_protected": strings.TrimSpace(s.cfg.Password) != "",
 	})
+}
+
+type providerInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func (s *Server) handleProviderList(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, []providerInfo{
+		{ID: "anthropic", Name: "Anthropic"},
+		{ID: "openai", Name: "OpenAI"},
+		{ID: "google", Name: "Google"},
+		{ID: "groq", Name: "Groq"},
+		{ID: "openrouter", Name: "OpenRouter"},
+		{ID: "together", Name: "Together"},
+	})
+}
+
+func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		http.Error(w, "provider id is required", http.StatusBadRequest)
+		return
+	}
+
+	p, err := providerFromID(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	models, err := p.Models(r.Context())
+	if err != nil {
+		http.Error(w, fmt.Sprintf("list models: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, models)
 }
 
 func (s *Server) handleSessionList(w http.ResponseWriter, r *http.Request) {
@@ -450,6 +490,21 @@ func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	streaming := shouldStreamPrompt(r)
+	var flusher http.Flusher
+	if streaming {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		var ok bool
+		flusher, ok = w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+	}
+
 	var (
 		output       strings.Builder
 		finishReason = ""
@@ -458,16 +513,14 @@ func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 	)
 
 	for evt := range events {
-		if evt.SessionID == "" {
-			evt.SessionID = id
+		envelope := toEventEnvelope(id, evt)
+		s.publishEvent(id, string(evt.Type), envelope)
+		if streaming {
+			if err := writeSSE(w, string(evt.Type), envelope); err != nil {
+				return
+			}
+			flusher.Flush()
 		}
-		s.publishEvent(id, string(evt.Type), map[string]any{
-			"type":       string(evt.Type),
-			"session_id": evt.SessionID,
-			"message_id": evt.MessageID,
-			"part_id":    evt.PartID,
-			"payload":    evt.Payload,
-		})
 
 		switch evt.Type {
 		case agent.EventTextDelta:
@@ -489,17 +542,30 @@ func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	resp := promptResponse{
+		SessionID:    id,
+		Output:       output.String(),
+		FinishReason: finishReason,
+		Usage:        usage,
+	}
+
+	if streaming {
+		if agentErr != "" {
+			_ = writeSSE(w, "error", map[string]any{"message": agentErr})
+			flusher.Flush()
+			return
+		}
+		_ = writeSSE(w, "response.completed", resp)
+		flusher.Flush()
+		return
+	}
+
 	if agentErr != "" {
 		http.Error(w, agentErr, http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, promptResponse{
-		SessionID:    id,
-		Output:       output.String(),
-		FinishReason: finishReason,
-		Usage:        usage,
-	})
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
@@ -720,6 +786,45 @@ func writeSSE(w http.ResponseWriter, eventName string, data any) error {
 	return nil
 }
 
+func shouldStreamPrompt(r *http.Request) bool {
+	v := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("stream")))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	accept := strings.ToLower(strings.TrimSpace(r.Header.Get("Accept")))
+	return strings.Contains(accept, "text/event-stream")
+}
+
+func toEventEnvelope(sessionID string, evt agent.Event) map[string]any {
+	if evt.SessionID == "" {
+		evt.SessionID = sessionID
+	}
+	return map[string]any{
+		"type":       string(evt.Type),
+		"session_id": evt.SessionID,
+		"message_id": evt.MessageID,
+		"part_id":    evt.PartID,
+		"payload":    evt.Payload,
+	}
+}
+
+func providerFromID(id string) (provider.Provider, error) {
+	id = strings.ToLower(strings.TrimSpace(id))
+	switch id {
+	case "anthropic":
+		return anthropicProvider.New("", ""), nil
+	case "openai":
+		return openaiProvider.New(""), nil
+	case "google", "gemini":
+		return googleProvider.New(""), nil
+	case "groq", "openrouter", "together":
+		return openaiProvider.NewCompatible(id, strings.Title(id), "", ""), nil
+	default:
+		return nil, fmt.Errorf("provider %q not found", id)
+	}
+}
+
 func defaultAgentFactory(store session.Store) AgentFactory {
 	return func(_ context.Context, args AgentFactoryArgs) (AgentRunner, error) {
 		cfg := args.Config
@@ -737,14 +842,9 @@ func defaultAgentFactory(store session.Store) AgentFactory {
 		}
 		providerName, modelID := splitModel(model)
 
-		var p provider.Provider
-		switch providerName {
-		case "openai", "groq", "openrouter", "together":
-			p = openaiProvider.NewCompatible(providerName, strings.Title(providerName), "", "")
-		case "google", "gemini":
-			p = googleProvider.New("")
-		default:
-			p = anthropicProvider.New("", "")
+		p, err := providerFromID(providerName)
+		if err != nil {
+			return nil, err
 		}
 
 		systemPrompt := cfg.Instructions
