@@ -280,6 +280,16 @@ func TestProviderEndpoints(t *testing.T) {
 		t.Fatalf("provider list missing expected providers: %s", rr.Body.String())
 	}
 
+	req = httptest.NewRequest(http.MethodGet, "/provider/openai", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("provider detail status = %d, want %d: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "\"id\":\"openai\"") || !strings.Contains(rr.Body.String(), "gpt-4o") {
+		t.Fatalf("provider detail response unexpected: %s", rr.Body.String())
+	}
+
 	req = httptest.NewRequest(http.MethodGet, "/provider/openai/models", nil)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -295,6 +305,13 @@ func TestProviderEndpoints(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("unknown provider status = %d, want %d", rr.Code, http.StatusNotFound)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/provider/unknown", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("unknown provider detail status = %d, want %d", rr.Code, http.StatusNotFound)
 	}
 }
 
@@ -338,6 +355,73 @@ func TestSessionPromptStreamingMode(t *testing.T) {
 	}
 	if !strings.Contains(body, "event: response.completed") {
 		t.Fatalf("expected response.completed event in stream, got: %s", body)
+	}
+}
+
+func TestSessionCancelEndpoint(t *testing.T) {
+	ctx := context.Background()
+	store := openStoreForTest(t)
+	workDir := t.TempDir()
+	now := time.Now().UTC()
+
+	if err := store.CreateSession(ctx, session.Session{
+		ID:        "sess-cancel",
+		ProjectID: git.SlugFromRoot(workDir),
+		Directory: workDir,
+		Title:     "cancel",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	factory := func(_ context.Context, _ AgentFactoryArgs) (AgentRunner, error) {
+		return blockingRunner{}, nil
+	}
+
+	s := New(config.ServerConfig{}, Options{WorkDir: workDir, SessionStore: store, AgentFactory: factory})
+	h := s.buildRouter()
+
+	promptReq := httptest.NewRequest(http.MethodPost, "/session/sess-cancel/prompt", bytes.NewBufferString(`{"prompt":"long task"}`))
+	promptRR := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(promptRR, promptReq)
+		close(done)
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+
+	cancelReq := httptest.NewRequest(http.MethodPost, "/session/sess-cancel/cancel", nil)
+	cancelRR := httptest.NewRecorder()
+	h.ServeHTTP(cancelRR, cancelReq)
+	if cancelRR.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d, want %d: %s", cancelRR.Code, http.StatusOK, cancelRR.Body.String())
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prompt request did not complete after cancellation")
+	}
+
+	if promptRR.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want %d: %s", promptRR.Code, http.StatusOK, promptRR.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(promptRR.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode prompt response: %v", err)
+	}
+	if resp.FinishReason != string(agent.ReasonAborted) {
+		t.Fatalf("finishReason = %q, want %q", resp.FinishReason, string(agent.ReasonAborted))
+	}
+
+	cancelReq = httptest.NewRequest(http.MethodPost, "/session/sess-cancel/cancel", nil)
+	cancelRR = httptest.NewRecorder()
+	h.ServeHTTP(cancelRR, cancelReq)
+	if cancelRR.Code != http.StatusConflict {
+		t.Fatalf("second cancel status = %d, want %d", cancelRR.Code, http.StatusConflict)
 	}
 }
 
@@ -396,5 +480,17 @@ func (f fakeRunner) Run(_ context.Context, _ agent.RunOptions) (<-chan agent.Eve
 		ch <- evt
 	}
 	close(ch)
+	return ch, nil
+}
+
+type blockingRunner struct{}
+
+func (blockingRunner) Run(ctx context.Context, _ agent.RunOptions) (<-chan agent.Event, error) {
+	ch := make(chan agent.Event, 1)
+	go func() {
+		<-ctx.Done()
+		ch <- agent.Event{Type: agent.EventDone, Payload: string(agent.ReasonAborted)}
+		close(ch)
+	}()
 	return ch, nil
 }

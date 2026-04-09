@@ -48,6 +48,9 @@ type Server struct {
 	mu     sync.RWMutex
 	nextID uint64
 	subs   map[string]map[uint64]chan streamedEvent
+
+	runMu sync.RWMutex
+	runs  map[string]activePromptRun
 }
 
 // Options configures server dependencies.
@@ -77,6 +80,15 @@ type streamedEvent struct {
 	Data any
 }
 
+type activePromptRun struct {
+	RunID     string
+	Cancel    context.CancelFunc
+	Started   time.Time
+	Model     string
+	Prompt    string
+	SessionID string
+}
+
 // New creates a Server with the given configuration.
 func New(cfg config.ServerConfig, opts Options) *Server {
 	factory := opts.AgentFactory
@@ -90,6 +102,7 @@ func New(cfg config.ServerConfig, opts Options) *Server {
 		sessions: opts.SessionStore,
 		newAgent: factory,
 		subs:     make(map[string]map[uint64]chan streamedEvent),
+		runs:     make(map[string]activePromptRun),
 	}
 	s.router = s.buildRouter()
 	return s
@@ -128,6 +141,7 @@ func (s *Server) buildRouter() http.Handler {
 	mux.HandleFunc("GET /project", s.handleProject)
 	mux.HandleFunc("GET /config", s.handleConfig)
 	mux.HandleFunc("GET /provider", s.handleProviderList)
+	mux.HandleFunc("GET /provider/{id}", s.handleProviderGet)
 	mux.HandleFunc("GET /provider/{id}/models", s.handleProviderModels)
 	mux.HandleFunc("GET /session", s.handleSessionList)
 	mux.HandleFunc("POST /session", s.handleSessionCreate)
@@ -135,6 +149,7 @@ func (s *Server) buildRouter() http.Handler {
 	mux.HandleFunc("DELETE /session/{id}", s.handleSessionArchive)
 	mux.HandleFunc("GET /session/{id}/messages", s.handleSessionMessages)
 	mux.HandleFunc("POST /session/{id}/prompt", s.handleSessionPrompt)
+	mux.HandleFunc("POST /session/{id}/cancel", s.handleSessionCancel)
 	mux.HandleFunc("GET /session/{id}/events", s.handleSessionEvents)
 	return mux
 }
@@ -182,6 +197,13 @@ type providerInfo struct {
 	Name string `json:"name"`
 }
 
+type providerDetail struct {
+	ID         string           `json:"id"`
+	Name       string           `json:"name"`
+	ModelCount int              `json:"model_count"`
+	Models     []provider.Model `json:"models"`
+}
+
 func (s *Server) handleProviderList(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, []providerInfo{
 		{ID: "anthropic", Name: "Anthropic"},
@@ -190,6 +212,33 @@ func (s *Server) handleProviderList(w http.ResponseWriter, _ *http.Request) {
 		{ID: "groq", Name: "Groq"},
 		{ID: "openrouter", Name: "OpenRouter"},
 		{ID: "together", Name: "Together"},
+	})
+}
+
+func (s *Server) handleProviderGet(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		http.Error(w, "provider id is required", http.StatusBadRequest)
+		return
+	}
+
+	p, err := providerFromID(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	models, err := p.Models(r.Context())
+	if err != nil {
+		http.Error(w, fmt.Sprintf("list models: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, providerDetail{
+		ID:         p.ID(),
+		Name:       p.Name(),
+		ModelCount: len(models),
+		Models:     models,
 	})
 }
 
@@ -419,10 +468,17 @@ type promptRequest struct {
 }
 
 type promptResponse struct {
+	RunID        string          `json:"run_id"`
 	SessionID    string          `json:"session_id"`
 	Output       string          `json:"output"`
 	FinishReason string          `json:"finish_reason"`
 	Usage        agent.UsageInfo `json:"usage"`
+}
+
+type cancelResponse struct {
+	SessionID string `json:"session_id"`
+	RunID     string `json:"run_id"`
+	Cancelled bool   `json:"cancelled"`
 }
 
 func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
@@ -484,8 +540,22 @@ func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events, err := runner.Run(r.Context(), agent.RunOptions{Prompt: req.Prompt, SessionID: id})
+	runID := uuid.NewString()
+	runCtx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	s.registerRun(id, activePromptRun{
+		RunID:     runID,
+		Cancel:    cancel,
+		Started:   time.Now().UTC(),
+		Model:     cfg.Model,
+		Prompt:    req.Prompt,
+		SessionID: id,
+	})
+	defer s.clearRun(id, runID)
+
+	events, err := runner.Run(runCtx, agent.RunOptions{Prompt: req.Prompt, SessionID: id})
 	if err != nil {
+		cancel()
 		http.Error(w, fmt.Sprintf("run agent: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -543,6 +613,7 @@ func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := promptResponse{
+		RunID:        runID,
 		SessionID:    id,
 		Output:       output.String(),
 		FinishReason: finishReason,
@@ -566,6 +637,26 @@ func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleSessionCancel(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		http.Error(w, "session id is required", http.StatusBadRequest)
+		return
+	}
+
+	run, ok := s.cancelRun(id)
+	if !ok {
+		http.Error(w, "no active run for session", http.StatusConflict)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, cancelResponse{
+		SessionID: id,
+		RunID:     run.RunID,
+		Cancelled: true,
+	})
 }
 
 func (s *Server) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
@@ -739,6 +830,48 @@ func (s *Server) publishEvent(sessionID, name string, payload any) {
 		default:
 		}
 	}
+}
+
+func (s *Server) registerRun(sessionID string, run activePromptRun) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	s.runMu.Lock()
+	if prev, ok := s.runs[sessionID]; ok && prev.Cancel != nil {
+		prev.Cancel()
+	}
+	s.runs[sessionID] = run
+	s.runMu.Unlock()
+}
+
+func (s *Server) clearRun(sessionID, runID string) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	s.runMu.Lock()
+	if run, ok := s.runs[sessionID]; ok {
+		if runID == "" || run.RunID == runID {
+			delete(s.runs, sessionID)
+		}
+	}
+	s.runMu.Unlock()
+}
+
+func (s *Server) cancelRun(sessionID string) (activePromptRun, bool) {
+	s.runMu.Lock()
+	run, ok := s.runs[sessionID]
+	if ok {
+		delete(s.runs, sessionID)
+	}
+	s.runMu.Unlock()
+
+	if !ok {
+		return activePromptRun{}, false
+	}
+	if run.Cancel != nil {
+		run.Cancel()
+	}
+	return run, true
 }
 
 func (s *Server) subscribeSession(sessionID string) (<-chan streamedEvent, func()) {
