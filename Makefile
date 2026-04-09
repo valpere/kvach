@@ -38,7 +38,11 @@ fmt:
 	gofmt -w .
 
 fmt-check:
-	@test -z "$(shell gofmt -l .)" || (printf "Unformatted files:\n%s\n" "$(shell gofmt -l .)" && false)
+	@files="$$(gofmt -l .)"; \
+	if [ -n "$$files" ]; then \
+		printf "Unformatted files:\n%s\n" "$$files"; \
+		false; \
+	fi
 
 tidy:
 	$(GO) mod tidy

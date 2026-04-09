@@ -16,8 +16,15 @@ go test ./...     # must pass — zero test failures
 gofmt -w .        # format all Go files before committing
 ```
 
-There is no Makefile. These four commands are the entire validation pipeline.
-The project has no CI workflow yet — rely on local validation.
+The repository also includes a `Makefile` with equivalent helpers:
+
+```bash
+make check   # gofmt -w . + go build ./... + go vet ./... + go test ./...
+make ci      # gofmt check + go build ./... + go vet ./... + go test ./...
+```
+
+A GitHub Actions CI workflow runs these checks on pull requests and pushes to
+`main`.
 
 External dependencies are minimal: `gopkg.in/yaml.v3`, `github.com/spf13/cobra`.
 Do not add new external deps without explicit justification.
